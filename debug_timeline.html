@@ -1,0 +1,328 @@
+
+<!DOCTYPE html>
+<html>
+<head>
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono&family=Bebas+Neue&display=swap" rel="stylesheet">
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: 'Space Mono', monospace; background: #f8fafc; color: #0f172a; padding: 1rem; }
+h3 { font-family: 'Bebas Neue', sans-serif; }
+
+.controls {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background: white;
+    padding: 0.75rem 1rem;
+    border: 1px solid #e2e8f0;
+    margin-bottom: 1rem;
+}
+.ctrl-group {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+}
+button, select {
+    font-family: 'Space Mono', monospace;
+    background: white;
+    border: 1px solid #e2e8f0;
+    padding: 0.25rem 0.5rem;
+    cursor: pointer;
+    font-size: 0.8rem;
+}
+.toggle-btn.active {
+    background: #0f172a;
+    color: white;
+    border-color: #0f172a;
+}
+.legend-item { display: flex; align-items: center; gap: 0.3rem; font-size: 0.75rem; }
+.legend-box { width: 10px; height: 10px; }
+.box-normal { background: #dbeafe; border: 1px solid #3b82f6; }
+.box-warning { background: #fef3c7; border: 1px solid #f59e0b; }
+.box-conflict { background: #fee2e2; border: 1px solid #ef4444; }
+
+.grid-container {
+    background: white;
+    border: 1px solid #e2e8f0;
+    overflow-x: auto;
+    position: relative;
+    padding-bottom: 1rem;
+}
+.grid-header {
+    display: flex;
+    border-bottom: 1px solid #e2e8f0;
+    height: 30px;
+}
+.left-col {
+    width: 110px;
+    min-width: 110px;
+    border-right: 1px solid #e2e8f0;
+    padding: 0.5rem;
+    font-size: 0.8rem;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    background: #f8fafc;
+    z-index: 20;
+    position: sticky;
+    left: 0;
+}
+.ticks-container {
+    flex: 1;
+    position: relative;
+    min-width: 800px;
+}
+.tick {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    border-left: 1px dashed #e2e8f0;
+    font-size: 0.7rem;
+    color: #94a3b8;
+    padding-left: 2px;
+}
+.aircraft-row {
+    display: flex;
+    height: 52px;
+    border-bottom: 1px solid #e2e8f0;
+}
+.aircraft-row:hover {
+    background: #f1f5f9;
+}
+.track {
+    flex: 1;
+    position: relative;
+    min-width: 800px;
+}
+.flight-block {
+    position: absolute;
+    height: 36px;
+    top: 8px;
+    border-radius: 0;
+    cursor: pointer;
+    padding: 2px 4px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    text-align: left;
+    font-size: 11px;
+    transition: opacity 0.2s;
+}
+.flight-block.op-down {
+    opacity: 0.2 !important;
+}
+.flight-block:hover {
+    opacity: 0.8 !important;
+    z-index: 10;
+}
+.block-normal { background: #dbeafe; border-left: 3px solid #3b82f6; color: #1e40af; }
+.block-warning { background: #fef3c7; border-left: 3px solid #f59e0b; color: #92400e; }
+.block-conflict { background: #fee2e2; border-left: 3px solid #ef4444; color: #991b1b; }
+
+.detail-panel {
+    background: white;
+    border: 1px solid #e2e8f0;
+    margin-top: 1rem;
+    padding: 1rem;
+    display: none;
+    position: relative;
+}
+.detail-panel.visible { display: block; }
+.close-btn { position: absolute; right: 1rem; top: 1rem; cursor: pointer; font-size: 1.2rem; }
+.detail-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 1rem;
+}
+.dc-label { font-size: 10px; text-transform: uppercase; color: #94a3b8; margin-bottom: 2px; }
+.dc-value { font-size: 14px; }
+</style>
+</head>
+<body>
+
+<div class="controls">
+    <div class="ctrl-group">
+        <button id="btnPrev">&lt;</button>
+        <span id="dateLabel" style="font-weight: bold; width: 100px; text-align: center;">YYYY-MM-DD</span>
+        <button id="btnNext">&gt;</button>
+    </div>
+    <div class="ctrl-group">
+        <select id="acFilter"><option value="ALL">All Aircraft</option></select>
+    </div>
+    <div class="ctrl-group" id="toggles">
+        <button class="toggle-btn active" data-type="normal">Normal</button>
+        <button class="toggle-btn active" data-type="warning">Warning</button>
+        <button class="toggle-btn active" data-type="conflict">Conflict</button>
+    </div>
+    <div class="ctrl-group">
+        <div class="legend-item"><div class="legend-box box-normal"></div>Normal</div>
+        <div class="legend-item"><div class="legend-box box-warning"></div>Warning</div>
+        <div class="legend-item"><div class="legend-box box-conflict"></div>Conflict</div>
+    </div>
+</div>
+
+<div class="grid-container">
+    <div class="grid-header">
+        <div class="left-col" style="background: transparent; border-right: none;"></div>
+        <div class="ticks-container" id="ticksContainer"></div>
+    </div>
+    <div id="rowsContainer"></div>
+</div>
+
+<div class="detail-panel" id="detailPanel">
+    <div class="close-btn" onclick="document.getElementById('detailPanel').classList.remove('visible')">×</div>
+    <div class="detail-grid" id="detailGrid"></div>
+</div>
+
+<script>
+const FLIGHTS = [{"id": "AI108", "date": "2024-01-09", "aircraft": "VT-ABC", "route": "Mumbai (BOM)\u2192Bhubaneswar (BBI)", "dep": 10.0, "arr": 12.25, "cap": "Capt. Sharma", "fo": "FO Kumar", "status": "normal", "issue": ""}, {"id": "AI109", "date": "2024-01-10", "aircraft": "VT-ABC", "route": "Mumbai (BOM)\u2192Hyderabad (HYD)", "dep": 10.0, "arr": 12.25, "cap": "Capt. Patel", "fo": "FO Das", "status": "normal", "issue": ""}, {"id": "AI113", "date": "2024-01-14", "aircraft": "VT-ABC", "route": "Mumbai (BOM)\u2192Kolkata (CCU)", "dep": 10.0, "arr": 12.25, "cap": "Capt. Sharma", "fo": "FO Verma", "status": "warning", "issue": "Delayed"}, {"id": "AI114", "date": "2024-01-15", "aircraft": "VT-ABC", "route": "Bangalore (BLR)\u2192Bhubaneswar (BBI)", "dep": 10.0, "arr": 12.25, "cap": "Capt. Singh", "fo": "FO Verma", "status": "normal", "issue": ""}, {"id": "AI116", "date": "2024-01-17", "aircraft": "VT-ABC", "route": "Delhi (DEL)\u2192Bhubaneswar (BBI)", "dep": 10.0, "arr": 12.25, "cap": "Capt. Patel", "fo": "FO Das", "status": "normal", "issue": ""}, {"id": "AI117", "date": "2024-01-18", "aircraft": "VT-ABC", "route": "Delhi (DEL)\u2192Kolkata (CCU)", "dep": 10.0, "arr": 12.25, "cap": "Capt. Patel", "fo": "FO Das", "status": "normal", "issue": ""}, {"id": "AI121", "date": "2024-01-22", "aircraft": "VT-ABC", "route": "Delhi (DEL)\u2192Bhubaneswar (BBI)", "dep": 10.0, "arr": 12.25, "cap": "Capt. Patel", "fo": "FO Joshi", "status": "normal", "issue": ""}, {"id": "AI122", "date": "2024-01-23", "aircraft": "VT-ABC", "route": "Delhi (DEL)\u2192Bhubaneswar (BBI)", "dep": 10.0, "arr": 12.25, "cap": "Capt. Gupta", "fo": "FO Joshi", "status": "warning", "issue": "Delayed"}, {"id": "AI127", "date": "2024-01-28", "aircraft": "VT-ABC", "route": "Mumbai (BOM)\u2192Bhubaneswar (BBI)", "dep": 10.0, "arr": 12.25, "cap": "Capt. Sharma", "fo": "FO Nair", "status": "normal", "issue": ""}, {"id": "AI131", "date": "2024-02-01", "aircraft": "VT-ABC", "route": "Mumbai (BOM)\u2192Hyderabad (HYD)", "dep": 10.0, "arr": 12.25, "cap": "Capt. Rao", "fo": "FO Kumar", "status": "warning", "issue": "Delayed"}, {"id": "AI145", "date": "2024-02-15", "aircraft": "VT-ABC", "route": "Bangalore (BLR)\u2192Hyderabad (HYD)", "dep": 10.0, "arr": 12.25, "cap": "Capt. Patel", "fo": "FO Nair", "status": "normal", "issue": ""}, {"id": "AI150", "date": "2024-02-20", "aircraft": "VT-ABC", "route": "Mumbai (BOM)\u2192Bhubaneswar (BBI)", "dep": 14.0, "arr": 16.25, "cap": "Capt. Rao", "fo": "FO Das", "status": "warning", "issue": "Delayed"}, {"id": "AI156", "date": "2024-02-26", "aircraft": "VT-ABC", "route": "Delhi (DEL)\u2192Hyderabad (HYD)", "dep": 14.0, "arr": 16.25, "cap": "Capt. Sharma", "fo": "FO Joshi", "status": "warning", "issue": "Delayed"}, {"id": "AI157", "date": "2024-02-27", "aircraft": "VT-ABC", "route": "Delhi (DEL)\u2192Kolkata (CCU)", "dep": 14.0, "arr": 16.25, "cap": "Capt. Singh", "fo": "FO Verma", "status": "normal", "issue": ""}, {"id": "AI161", "date": "2024-03-02", "aircraft": "VT-ABC", "route": "Bangalore (BLR)\u2192Hyderabad (HYD)", "dep": 14.0, "arr": 16.25, "cap": "Capt. Sharma", "fo": "FO Das", "status": "normal", "issue": ""}, {"id": "AI165", "date": "2024-03-06", "aircraft": "VT-ABC", "route": "Mumbai (BOM)\u2192Kolkata (CCU)", "dep": 14.0, "arr": 16.25, "cap": "Capt. Rao", "fo": "FO Verma", "status": "normal", "issue": ""}, {"id": "AI167", "date": "2024-03-08", "aircraft": "VT-ABC", "route": "Bangalore (BLR)\u2192Kolkata (CCU)", "dep": 14.0, "arr": 16.25, "cap": "Capt. Rao", "fo": "FO Joshi", "status": "warning", "issue": "Delayed"}, {"id": "AI170", "date": "2024-03-11", "aircraft": "VT-ABC", "route": "Mumbai (BOM)\u2192Bhubaneswar (BBI)", "dep": 14.0, "arr": 16.25, "cap": "Capt. Rao", "fo": "FO Das", "status": "warning", "issue": "Delayed"}, {"id": "AI173", "date": "2024-03-14", "aircraft": "VT-ABC", "route": "Bangalore (BLR)\u2192Hyderabad (HYD)", "dep": 14.0, "arr": 16.25, "cap": "Capt. Singh", "fo": "FO Nair", "status": "warning", "issue": "Delayed"}, {"id": "AI175", "date": "2024-03-16", "aircraft": "VT-ABC", "route": "Delhi (DEL)\u2192Bhubaneswar (BBI)", "dep": 14.0, "arr": 16.25, "cap": "Capt. Singh", "fo": "FO Kumar", "status": "warning", "issue": "Delayed"}, {"id": "AI176", "date": "2024-03-17", "aircraft": "VT-ABC", "route": "Mumbai (BOM)\u2192Bhubaneswar (BBI)", "dep": 14.0, "arr": 16.25, "cap": "Capt. Singh", "fo": "FO Nair", "status": "warning", "issue": "Delayed"}, {"id": "AI179", "date": "2024-03-20", "aircraft": "VT-ABC", "route": "Delhi (DEL)\u2192Bhubaneswar (BBI)", "dep": 14.0, "arr": 16.25, "cap": "Capt. Rao", "fo": "FO Das", "status": "warning", "issue": "Delayed"}, {"id": "AI181", "date": "2024-03-22", "aircraft": "VT-ABC", "route": "Bangalore (BLR)\u2192Kolkata (CCU)", "dep": 14.0, "arr": 16.25, "cap": "Capt. Singh", "fo": "FO Das", "status": "normal", "issue": ""}, {"id": "AI184", "date": "2024-03-25", "aircraft": "VT-ABC", "route": "Bangalore (BLR)\u2192Hyderabad (HYD)", "dep": 14.0, "arr": 16.25, "cap": "Capt. Singh", "fo": "FO Kumar", "status": "normal", "issue": ""}, {"id": "AI193", "date": "2024-04-03", "aircraft": "VT-ABC", "route": "Delhi (DEL)\u2192Kolkata (CCU)", "dep": 14.0, "arr": 16.25, "cap": "Capt. Singh", "fo": "FO Verma", "status": "normal", "issue": ""}, {"id": "AI195", "date": "2024-04-05", "aircraft": "VT-ABC", "route": "Mumbai (BOM)\u2192Kolkata (CCU)", "dep": 14.0, "arr": 16.25, "cap": "Capt. Gupta", "fo": "FO Nair", "status": "normal", "issue": ""}, {"id": "AI196", "date": "2024-04-06", "aircraft": "VT-ABC", "route": "Mumbai (BOM)\u2192Hyderabad (HYD)", "dep": 14.0, "arr": 16.25, "cap": "Capt. Gupta", "fo": "FO Das", "status": "warning", "issue": "Delayed"}, {"id": "AI198", "date": "2024-04-08", "aircraft": "VT-ABC", "route": "Bangalore (BLR)\u2192Hyderabad (HYD)", "dep": 14.0, "arr": 16.25, "cap": "Capt. Rao", "fo": "FO Das", "status": "normal", "issue": ""}, {"id": "AI100", "date": "2024-01-01", "aircraft": "VT-DEF", "route": "Bangalore (BLR)\u2192Hyderabad (HYD)", "dep": 10.0, "arr": 12.25, "cap": "Capt. Sharma", "fo": "FO Das", "status": "normal", "issue": ""}, {"id": "AI102", "date": "2024-01-03", "aircraft": "VT-DEF", "route": "Mumbai (BOM)\u2192Bhubaneswar (BBI)", "dep": 10.0, "arr": 12.25, "cap": "Capt. Rao", "fo": "FO Nair", "status": "normal", "issue": ""}, {"id": "AI104", "date": "2024-01-05", "aircraft": "VT-DEF", "route": "Bangalore (BLR)\u2192Hyderabad (HYD)", "dep": 10.0, "arr": 12.25, "cap": "Capt. Singh", "fo": "FO Nair", "status": "normal", "issue": ""}, {"id": "AI105", "date": "2024-01-06", "aircraft": "VT-DEF", "route": "Bangalore (BLR)\u2192Kolkata (CCU)", "dep": 10.0, "arr": 12.25, "cap": "Capt. Singh", "fo": "FO Joshi", "status": "normal", "issue": ""}, {"id": "AI111", "date": "2024-01-12", "aircraft": "VT-DEF", "route": "Bangalore (BLR)\u2192Kolkata (CCU)", "dep": 10.0, "arr": 12.25, "cap": "Capt. Sharma", "fo": "FO Nair", "status": "warning", "issue": "Delayed"}, {"id": "AI112", "date": "2024-01-13", "aircraft": "VT-DEF", "route": "Bangalore (BLR)\u2192Kolkata (CCU)", "dep": 10.0, "arr": 12.25, "cap": "Capt. Sharma", "fo": "FO Joshi", "status": "normal", "issue": ""}, {"id": "AI119", "date": "2024-01-20", "aircraft": "VT-DEF", "route": "Mumbai (BOM)\u2192Hyderabad (HYD)", "dep": 10.0, "arr": 12.25, "cap": "Capt. Patel", "fo": "FO Nair", "status": "normal", "issue": ""}, {"id": "AI125", "date": "2024-01-26", "aircraft": "VT-DEF", "route": "Delhi (DEL)\u2192Hyderabad (HYD)", "dep": 10.0, "arr": 12.25, "cap": "Capt. Patel", "fo": "FO Nair", "status": "normal", "issue": ""}, {"id": "AI129", "date": "2024-01-30", "aircraft": "VT-DEF", "route": "Delhi (DEL)\u2192Hyderabad (HYD)", "dep": 10.0, "arr": 12.25, "cap": "Capt. Gupta", "fo": "FO Verma", "status": "warning", "issue": "Delayed"}, {"id": "AI133", "date": "2024-02-03", "aircraft": "VT-DEF", "route": "Mumbai (BOM)\u2192Hyderabad (HYD)", "dep": 10.0, "arr": 12.25, "cap": "Capt. Singh", "fo": "FO Verma", "status": "normal", "issue": ""}, {"id": "AI134", "date": "2024-02-04", "aircraft": "VT-DEF", "route": "Delhi (DEL)\u2192Bhubaneswar (BBI)", "dep": 10.0, "arr": 12.25, "cap": "Capt. Rao", "fo": "FO Kumar", "status": "normal", "issue": ""}, {"id": "AI135", "date": "2024-02-05", "aircraft": "VT-DEF", "route": "Delhi (DEL)\u2192Bhubaneswar (BBI)", "dep": 10.0, "arr": 12.25, "cap": "Capt. Sharma", "fo": "FO Joshi", "status": "normal", "issue": ""}, {"id": "AI136", "date": "2024-02-06", "aircraft": "VT-DEF", "route": "Mumbai (BOM)\u2192Kolkata (CCU)", "dep": 10.0, "arr": 12.25, "cap": "Capt. Sharma", "fo": "FO Das", "status": "normal", "issue": ""}, {"id": "AI137", "date": "2024-02-07", "aircraft": "VT-DEF", "route": "Delhi (DEL)\u2192Kolkata (CCU)", "dep": 10.0, "arr": 12.25, "cap": "Capt. Gupta", "fo": "FO Joshi", "status": "normal", "issue": ""}, {"id": "AI142", "date": "2024-02-12", "aircraft": "VT-DEF", "route": "Bangalore (BLR)\u2192Kolkata (CCU)", "dep": 10.0, "arr": 12.25, "cap": "Capt. Rao", "fo": "FO Nair", "status": "warning", "issue": "Delayed"}, {"id": "AI143", "date": "2024-02-13", "aircraft": "VT-DEF", "route": "Mumbai (BOM)\u2192Hyderabad (HYD)", "dep": 10.0, "arr": 12.25, "cap": "Capt. Sharma", "fo": "FO Verma", "status": "normal", "issue": ""}, {"id": "AI144", "date": "2024-02-14", "aircraft": "VT-DEF", "route": "Bangalore (BLR)\u2192Hyderabad (HYD)", "dep": 10.0, "arr": 12.25, "cap": "Capt. Gupta", "fo": "FO Kumar", "status": "normal", "issue": ""}, {"id": "AI146", "date": "2024-02-16", "aircraft": "VT-DEF", "route": "Delhi (DEL)\u2192Bhubaneswar (BBI)", "dep": 10.0, "arr": 12.25, "cap": "Capt. Sharma", "fo": "FO Nair", "status": "normal", "issue": ""}, {"id": "AI149", "date": "2024-02-19", "aircraft": "VT-DEF", "route": "Bangalore (BLR)\u2192Hyderabad (HYD)", "dep": 10.0, "arr": 12.25, "cap": "Capt. Patel", "fo": "FO Kumar", "status": "normal", "issue": ""}, {"id": "AI151", "date": "2024-02-21", "aircraft": "VT-DEF", "route": "Delhi (DEL)\u2192Bhubaneswar (BBI)", "dep": 14.0, "arr": 16.25, "cap": "Capt. Patel", "fo": "FO Nair", "status": "normal", "issue": ""}, {"id": "AI154", "date": "2024-02-24", "aircraft": "VT-DEF", "route": "Delhi (DEL)\u2192Hyderabad (HYD)", "dep": 14.0, "arr": 16.25, "cap": "Capt. Singh", "fo": "FO Nair", "status": "normal", "issue": ""}, {"id": "AI163", "date": "2024-03-04", "aircraft": "VT-DEF", "route": "Delhi (DEL)\u2192Hyderabad (HYD)", "dep": 14.0, "arr": 16.25, "cap": "Capt. Rao", "fo": "FO Das", "status": "normal", "issue": ""}, {"id": "AI164", "date": "2024-03-05", "aircraft": "VT-DEF", "route": "Mumbai (BOM)\u2192Bhubaneswar (BBI)", "dep": 14.0, "arr": 16.25, "cap": "Capt. Gupta", "fo": "FO Nair", "status": "normal", "issue": ""}, {"id": "AI166", "date": "2024-03-07", "aircraft": "VT-DEF", "route": "Delhi (DEL)\u2192Bhubaneswar (BBI)", "dep": 14.0, "arr": 16.25, "cap": "Capt. Singh", "fo": "FO Verma", "status": "warning", "issue": "Delayed"}, {"id": "AI169", "date": "2024-03-10", "aircraft": "VT-DEF", "route": "Bangalore (BLR)\u2192Bhubaneswar (BBI)", "dep": 14.0, "arr": 16.25, "cap": "Capt. Singh", "fo": "FO Nair", "status": "normal", "issue": ""}, {"id": "AI171", "date": "2024-03-12", "aircraft": "VT-DEF", "route": "Bangalore (BLR)\u2192Kolkata (CCU)", "dep": 14.0, "arr": 16.25, "cap": "Capt. Sharma", "fo": "FO Das", "status": "normal", "issue": ""}, {"id": "AI172", "date": "2024-03-13", "aircraft": "VT-DEF", "route": "Bangalore (BLR)\u2192Kolkata (CCU)", "dep": 14.0, "arr": 16.25, "cap": "Capt. Patel", "fo": "FO Joshi", "status": "normal", "issue": ""}, {"id": "AI180", "date": "2024-03-21", "aircraft": "VT-DEF", "route": "Bangalore (BLR)\u2192Hyderabad (HYD)", "dep": 14.0, "arr": 16.25, "cap": "Capt. Patel", "fo": "FO Nair", "status": "normal", "issue": ""}, {"id": "AI185", "date": "2024-03-26", "aircraft": "VT-DEF", "route": "Delhi (DEL)\u2192Kolkata (CCU)", "dep": 14.0, "arr": 16.25, "cap": "Capt. Sharma", "fo": "FO Joshi", "status": "warning", "issue": "Delayed"}, {"id": "AI101", "date": "2024-01-02", "aircraft": "VT-LMN", "route": "Bangalore (BLR)\u2192Kolkata (CCU)", "dep": 10.0, "arr": 12.25, "cap": "Capt. Sharma", "fo": "FO Nair", "status": "normal", "issue": ""}, {"id": "AI103", "date": "2024-01-04", "aircraft": "VT-LMN", "route": "Bangalore (BLR)\u2192Hyderabad (HYD)", "dep": 10.0, "arr": 12.25, "cap": "Capt. Singh", "fo": "FO Kumar", "status": "normal", "issue": ""}, {"id": "AI106", "date": "2024-01-07", "aircraft": "VT-LMN", "route": "Mumbai (BOM)\u2192Hyderabad (HYD)", "dep": 10.0, "arr": 12.25, "cap": "Capt. Sharma", "fo": "FO Nair", "status": "normal", "issue": ""}, {"id": "AI107", "date": "2024-01-08", "aircraft": "VT-LMN", "route": "Mumbai (BOM)\u2192Bhubaneswar (BBI)", "dep": 10.0, "arr": 12.25, "cap": "Capt. Patel", "fo": "FO Joshi", "status": "warning", "issue": "Delayed"}, {"id": "AI123", "date": "2024-01-24", "aircraft": "VT-LMN", "route": "Bangalore (BLR)\u2192Bhubaneswar (BBI)", "dep": 10.0, "arr": 12.25, "cap": "Capt. Singh", "fo": "FO Nair", "status": "warning", "issue": "Delayed"}, {"id": "AI126", "date": "2024-01-27", "aircraft": "VT-LMN", "route": "Mumbai (BOM)\u2192Bhubaneswar (BBI)", "dep": 10.0, "arr": 12.25, "cap": "Capt. Rao", "fo": "FO Kumar", "status": "normal", "issue": ""}, {"id": "AI138", "date": "2024-02-08", "aircraft": "VT-LMN", "route": "Mumbai (BOM)\u2192Kolkata (CCU)", "dep": 10.0, "arr": 12.25, "cap": "Capt. Sharma", "fo": "FO Verma", "status": "normal", "issue": ""}, {"id": "AI139", "date": "2024-02-09", "aircraft": "VT-LMN", "route": "Delhi (DEL)\u2192Kolkata (CCU)", "dep": 10.0, "arr": 12.25, "cap": "Capt. Rao", "fo": "FO Kumar", "status": "normal", "issue": ""}, {"id": "AI140", "date": "2024-02-10", "aircraft": "VT-LMN", "route": "Delhi (DEL)\u2192Hyderabad (HYD)", "dep": 10.0, "arr": 12.25, "cap": "Capt. Rao", "fo": "FO Nair", "status": "warning", "issue": "Delayed"}, {"id": "AI141", "date": "2024-02-11", "aircraft": "VT-LMN", "route": "Delhi (DEL)\u2192Hyderabad (HYD)", "dep": 10.0, "arr": 12.25, "cap": "Capt. Patel", "fo": "FO Das", "status": "normal", "issue": ""}, {"id": "AI152", "date": "2024-02-22", "aircraft": "VT-LMN", "route": "Bangalore (BLR)\u2192Hyderabad (HYD)", "dep": 14.0, "arr": 16.25, "cap": "Capt. Rao", "fo": "FO Nair", "status": "warning", "issue": "Delayed"}, {"id": "AI159", "date": "2024-02-29", "aircraft": "VT-LMN", "route": "Delhi (DEL)\u2192Bhubaneswar (BBI)", "dep": 14.0, "arr": 16.25, "cap": "Capt. Sharma", "fo": "FO Kumar", "status": "normal", "issue": ""}, {"id": "AI160", "date": "2024-03-01", "aircraft": "VT-LMN", "route": "Delhi (DEL)\u2192Bhubaneswar (BBI)", "dep": 14.0, "arr": 16.25, "cap": "Capt. Singh", "fo": "FO Kumar", "status": "normal", "issue": ""}, {"id": "AI162", "date": "2024-03-03", "aircraft": "VT-LMN", "route": "Bangalore (BLR)\u2192Bhubaneswar (BBI)", "dep": 14.0, "arr": 16.25, "cap": "Capt. Gupta", "fo": "FO Verma", "status": "normal", "issue": ""}, {"id": "AI183", "date": "2024-03-24", "aircraft": "VT-LMN", "route": "Delhi (DEL)\u2192Bhubaneswar (BBI)", "dep": 14.0, "arr": 16.25, "cap": "Capt. Sharma", "fo": "FO Joshi", "status": "normal", "issue": ""}, {"id": "AI186", "date": "2024-03-27", "aircraft": "VT-LMN", "route": "Mumbai (BOM)\u2192Kolkata (CCU)", "dep": 14.0, "arr": 16.25, "cap": "Capt. Rao", "fo": "FO Nair", "status": "normal", "issue": ""}, {"id": "AI187", "date": "2024-03-28", "aircraft": "VT-LMN", "route": "Mumbai (BOM)\u2192Bhubaneswar (BBI)", "dep": 14.0, "arr": 16.25, "cap": "Capt. Gupta", "fo": "FO Joshi", "status": "normal", "issue": ""}, {"id": "AI188", "date": "2024-03-29", "aircraft": "VT-LMN", "route": "Mumbai (BOM)\u2192Kolkata (CCU)", "dep": 14.0, "arr": 16.25, "cap": "Capt. Rao", "fo": "FO Verma", "status": "warning", "issue": "Delayed"}, {"id": "AI190", "date": "2024-03-31", "aircraft": "VT-LMN", "route": "Delhi (DEL)\u2192Kolkata (CCU)", "dep": 14.0, "arr": 16.25, "cap": "Capt. Singh", "fo": "FO Das", "status": "normal", "issue": ""}, {"id": "AI191", "date": "2024-04-01", "aircraft": "VT-LMN", "route": "Bangalore (BLR)\u2192Hyderabad (HYD)", "dep": 14.0, "arr": 16.25, "cap": "Capt. Patel", "fo": "FO Verma", "status": "normal", "issue": ""}, {"id": "AI110", "date": "2024-01-11", "aircraft": "VT-XYZ", "route": "Mumbai (BOM)\u2192Hyderabad (HYD)", "dep": 10.0, "arr": 12.25, "cap": "Capt. Gupta", "fo": "FO Das", "status": "normal", "issue": ""}, {"id": "AI115", "date": "2024-01-16", "aircraft": "VT-XYZ", "route": "Mumbai (BOM)\u2192Hyderabad (HYD)", "dep": 10.0, "arr": 12.25, "cap": "Capt. Singh", "fo": "FO Verma", "status": "normal", "issue": ""}, {"id": "AI118", "date": "2024-01-19", "aircraft": "VT-XYZ", "route": "Delhi (DEL)\u2192Bhubaneswar (BBI)", "dep": 10.0, "arr": 12.25, "cap": "Capt. Sharma", "fo": "FO Joshi", "status": "normal", "issue": ""}, {"id": "AI120", "date": "2024-01-21", "aircraft": "VT-XYZ", "route": "Delhi (DEL)\u2192Kolkata (CCU)", "dep": 10.0, "arr": 12.25, "cap": "Capt. Singh", "fo": "FO Verma", "status": "warning", "issue": "Delayed"}, {"id": "AI124", "date": "2024-01-25", "aircraft": "VT-XYZ", "route": "Mumbai (BOM)\u2192Kolkata (CCU)", "dep": 10.0, "arr": 12.25, "cap": "Capt. Gupta", "fo": "FO Joshi", "status": "normal", "issue": ""}, {"id": "AI128", "date": "2024-01-29", "aircraft": "VT-XYZ", "route": "Mumbai (BOM)\u2192Hyderabad (HYD)", "dep": 10.0, "arr": 12.25, "cap": "Capt. Singh", "fo": "FO Verma", "status": "warning", "issue": "Delayed"}, {"id": "AI130", "date": "2024-01-31", "aircraft": "VT-XYZ", "route": "Delhi (DEL)\u2192Hyderabad (HYD)", "dep": 10.0, "arr": 12.25, "cap": "Capt. Rao", "fo": "FO Nair", "status": "warning", "issue": "Delayed"}, {"id": "AI132", "date": "2024-02-02", "aircraft": "VT-XYZ", "route": "Bangalore (BLR)\u2192Kolkata (CCU)", "dep": 10.0, "arr": 12.25, "cap": "Capt. Singh", "fo": "FO Kumar", "status": "warning", "issue": "Delayed"}, {"id": "AI147", "date": "2024-02-17", "aircraft": "VT-XYZ", "route": "Delhi (DEL)\u2192Bhubaneswar (BBI)", "dep": 10.0, "arr": 12.25, "cap": "Capt. Gupta", "fo": "FO Das", "status": "normal", "issue": ""}, {"id": "AI148", "date": "2024-02-18", "aircraft": "VT-XYZ", "route": "Mumbai (BOM)\u2192Kolkata (CCU)", "dep": 10.0, "arr": 12.25, "cap": "Capt. Sharma", "fo": "FO Das", "status": "warning", "issue": "Delayed"}, {"id": "AI153", "date": "2024-02-23", "aircraft": "VT-XYZ", "route": "Delhi (DEL)\u2192Bhubaneswar (BBI)", "dep": 14.0, "arr": 16.25, "cap": "Capt. Patel", "fo": "FO Verma", "status": "warning", "issue": "Delayed"}, {"id": "AI155", "date": "2024-02-25", "aircraft": "VT-XYZ", "route": "Delhi (DEL)\u2192Bhubaneswar (BBI)", "dep": 14.0, "arr": 16.25, "cap": "Capt. Sharma", "fo": "FO Kumar", "status": "normal", "issue": ""}, {"id": "AI158", "date": "2024-02-28", "aircraft": "VT-XYZ", "route": "Delhi (DEL)\u2192Bhubaneswar (BBI)", "dep": 14.0, "arr": 16.25, "cap": "Capt. Rao", "fo": "FO Verma", "status": "normal", "issue": ""}, {"id": "AI168", "date": "2024-03-09", "aircraft": "VT-XYZ", "route": "Bangalore (BLR)\u2192Kolkata (CCU)", "dep": 14.0, "arr": 16.25, "cap": "Capt. Rao", "fo": "FO Verma", "status": "warning", "issue": "Delayed"}, {"id": "AI174", "date": "2024-03-15", "aircraft": "VT-XYZ", "route": "Delhi (DEL)\u2192Kolkata (CCU)", "dep": 14.0, "arr": 16.25, "cap": "Capt. Patel", "fo": "FO Das", "status": "normal", "issue": ""}, {"id": "AI177", "date": "2024-03-18", "aircraft": "VT-XYZ", "route": "Mumbai (BOM)\u2192Kolkata (CCU)", "dep": 14.0, "arr": 16.25, "cap": "Capt. Gupta", "fo": "FO Nair", "status": "warning", "issue": "Delayed"}, {"id": "AI178", "date": "2024-03-19", "aircraft": "VT-XYZ", "route": "Bangalore (BLR)\u2192Hyderabad (HYD)", "dep": 14.0, "arr": 16.25, "cap": "Capt. Gupta", "fo": "FO Joshi", "status": "warning", "issue": "Delayed"}, {"id": "AI182", "date": "2024-03-23", "aircraft": "VT-XYZ", "route": "Bangalore (BLR)\u2192Hyderabad (HYD)", "dep": 14.0, "arr": 16.25, "cap": "Capt. Rao", "fo": "FO Kumar", "status": "normal", "issue": ""}, {"id": "AI189", "date": "2024-03-30", "aircraft": "VT-XYZ", "route": "Delhi (DEL)\u2192Bhubaneswar (BBI)", "dep": 14.0, "arr": 16.25, "cap": "Capt. Sharma", "fo": "FO Das", "status": "normal", "issue": ""}, {"id": "AI192", "date": "2024-04-02", "aircraft": "VT-XYZ", "route": "Bangalore (BLR)\u2192Hyderabad (HYD)", "dep": 14.0, "arr": 16.25, "cap": "Capt. Rao", "fo": "FO Kumar", "status": "normal", "issue": ""}, {"id": "AI194", "date": "2024-04-04", "aircraft": "VT-XYZ", "route": "Bangalore (BLR)\u2192Kolkata (CCU)", "dep": 14.0, "arr": 16.25, "cap": "Capt. Gupta", "fo": "FO Nair", "status": "normal", "issue": ""}, {"id": "AI197", "date": "2024-04-07", "aircraft": "VT-XYZ", "route": "Mumbai (BOM)\u2192Hyderabad (HYD)", "dep": 14.0, "arr": 16.25, "cap": "Capt. Singh", "fo": "FO Nair", "status": "normal", "issue": ""}, {"id": "AI199", "date": "2024-04-09", "aircraft": "VT-XYZ", "route": "Mumbai (BOM)\u2192Hyderabad (HYD)", "dep": 14.0, "arr": 16.25, "cap": "Capt. Singh", "fo": "FO Verma", "status": "normal", "issue": ""}];
+
+let dates = [...new Set(FLIGHTS.map(f => f.date))].sort();
+let currentDateIdx = 0;
+let aircraftList = [...new Set(FLIGHTS.map(f => f.aircraft))].sort();
+let activeFilters = { normal: true, warning: true, conflict: true };
+let selectedAc = 'ALL';
+
+const dateLabel = document.getElementById('dateLabel');
+const acFilter = document.getElementById('acFilter');
+const ticksContainer = document.getElementById('ticksContainer');
+const rowsContainer = document.getElementById('rowsContainer');
+const detailPanel = document.getElementById('detailPanel');
+const detailGrid = document.getElementById('detailGrid');
+
+for (let i = 0; i <= 24; i += 2) {
+    let tick = document.createElement('div');
+    tick.className = 'tick';
+    tick.style.left = (i / 24 * 100) + '%';
+    tick.innerText = (i < 10 ? '0'+i : i) + ':00';
+    ticksContainer.appendChild(tick);
+}
+
+aircraftList.forEach(ac => {
+    let opt = document.createElement('option');
+    opt.value = ac;
+    opt.innerText = ac;
+    acFilter.appendChild(opt);
+});
+
+acFilter.addEventListener('change', (e) => {
+    selectedAc = e.target.value;
+    renderGrid();
+});
+
+document.getElementById('btnPrev').addEventListener('click', () => {
+    if (currentDateIdx > 0) { currentDateIdx--; renderGrid(); }
+});
+document.getElementById('btnNext').addEventListener('click', () => {
+    if (currentDateIdx < dates.length - 1) { currentDateIdx++; renderGrid(); }
+});
+
+document.querySelectorAll('.toggle-btn').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+        let type = e.target.getAttribute('data-type');
+        activeFilters[type] = !activeFilters[type];
+        e.target.classList.toggle('active', activeFilters[type]);
+        updateBlockVisibility();
+    });
+});
+
+function renderGrid() {
+    if (dates.length === 0) return;
+    let curDate = dates[currentDateIdx];
+    dateLabel.innerText = curDate;
+    
+    rowsContainer.innerHTML = '';
+    
+    let currentFlights = FLIGHTS.filter(f => f.date === curDate);
+    
+    let acsToRender = selectedAc === 'ALL' ? aircraftList : [selectedAc];
+    
+    acsToRender.forEach(ac => {
+        let acFlights = currentFlights.filter(f => f.aircraft === ac);
+        
+        let row = document.createElement('div');
+        row.className = 'aircraft-row';
+        
+        let warns = acFlights.filter(f => f.status === 'warning').length;
+        let confs = acFlights.filter(f => f.status === 'conflict').length;
+        let subLabelText = "Clear";
+        let subColor = "#94a3b8";
+        if (confs > 0) { subLabelText = confs + " Conflict" + (confs>1?'s':''); subColor = "#ef4444"; }
+        else if (warns > 0) { subLabelText = warns + " Warning" + (warns>1?'s':''); subColor = "#f59e0b"; }
+        
+        row.innerHTML = `
+            <div class="left-col">
+                <div style="font-weight:bold;">${ac}</div>
+                <div style="font-size:0.65rem; color:${subColor};">${subLabelText}</div>
+            </div>
+            <div class="track" id="track-${ac}"></div>
+        `;
+        rowsContainer.appendChild(row);
+        
+        let track = row.querySelector('.track');
+        acFlights.forEach(f => {
+            let block = document.createElement('button');
+            block.className = `flight-block block-${f.status}`;
+            block.style.left = ((f.dep / 24) * 100) + '%';
+            
+            let duration = f.arr - f.dep;
+            if (duration < 0) duration += 24; 
+            block.style.width = ((duration / 24) * 100) + '%';
+            
+            block.innerText = f.id + " " + f.route;
+            block.setAttribute('data-type', f.status);
+            
+            block.onclick = () => showDetail(f);
+            track.appendChild(block);
+        });
+    });
+    
+    updateBlockVisibility();
+    detailPanel.classList.remove('visible');
+}
+
+function updateBlockVisibility() {
+    document.querySelectorAll('.flight-block').forEach(block => {
+        let type = block.getAttribute('data-type');
+        if (activeFilters[type]) {
+            block.classList.remove('op-down');
+        } else {
+            block.classList.add('op-down');
+        }
+    });
+}
+
+function formatFloatHour(hourFloat) {
+    let h = Math.floor(hourFloat);
+    let m = Math.round((hourFloat - h) * 60);
+    if (m === 60) { h++; m = 0; }
+    h = h % 24;
+    return (h < 10 ? '0'+h : h) + ':' + (m < 10 ? '0'+m : m);
+}
+
+function showDetail(f) {
+    detailPanel.classList.add('visible');
+    let dur = f.arr - f.dep;
+    if (dur < 0) dur += 24;
+    
+    let durStr = Math.floor(dur) + 'h ' + Math.round((dur - Math.floor(dur)) * 60) + 'm';
+    
+    let issueStr = f.issue ? f.issue : "None";
+    let issueColor = f.status === 'conflict' ? '#ef4444' : (f.status === 'warning' ? '#f59e0b' : '#0f172a');
+    
+    detailGrid.innerHTML = `
+        <div><div class="dc-label">Route</div><div class="dc-value">${f.route}</div></div>
+        <div><div class="dc-label">Departure</div><div class="dc-value">${formatFloatHour(f.dep)}</div></div>
+        <div><div class="dc-label">Arrival</div><div class="dc-value">${formatFloatHour(f.arr)}</div></div>
+        <div><div class="dc-label">Block Time</div><div class="dc-value">${durStr}</div></div>
+        <div><div class="dc-label">Captain</div><div class="dc-value">${f.cap}</div></div>
+        <div><div class="dc-label">First Officer</div><div class="dc-value">${f.fo}</div></div>
+        <div><div class="dc-label">Aircraft</div><div class="dc-value">${f.aircraft}</div></div>
+        <div><div class="dc-label">Conflict Reason</div><div class="dc-value" style="color:${issueColor};">${issueStr}</div></div>
+    `;
+}
+
+renderGrid();
+</script>
+</body>
+</html>

@@ -1,0 +1,323 @@
+================================================================================
+FLIGHT SCHEDULE OPTIMIZER / PILOT SCHEDULER — PROJECT DOCUMENTATION
+================================================================================
+Generated from codebase analysis (primary application: test4.py).
+Other files in the repository (app.py, app1.py, test.py, bioi.py) are alternate or
+legacy variants; requirements.txt targets the stack used by the integrated app.
+
+--------------------------------------------------------------------------------
+1. PURPOSE AND SCOPE
+--------------------------------------------------------------------------------
+The system is a web-based operations decision-support tool that combines:
+  • Flight-level analytics (delays, congestion, cascading propagation on aircraft
+    rotations) with Indian airport–centric capacity assumptions.
+  • Crew-oriented views: pilot fatigue risk (ML + rules), DGCA-style compliance
+    checks, interactive schedule boards, and alert-style summaries.
+
+It is not a certified operational system; regulatory labels (DGCA, duty limits) in
+the UI are implemented as approximations and demonstrations for UX and logic
+prototyping.
+
+--------------------------------------------------------------------------------
+2. TECHNOLOGY STACK (RUNTIME)
+--------------------------------------------------------------------------------
+Language (application):     Python 3.x
+
+Primary UI framework:       Streamlit
+  • Server-side Python renders widgets, charts, and layouts.
+  • No separate compiled frontend bundle; the “front end” is Streamlit’s
+    component model plus injected HTML/CSS/JS where interactivity exceeds
+    native Streamlit (e.g., drag-and-drop scheduling board, Gantt-style grids).
+
+Visualization:
+  • Plotly (plotly.express, plotly.graph_objects) — interactive charts, gauges,
+    heatmaps, network diagrams.
+  • Matplotlib / Seaborn — imported for general plotting support.
+  • NetworkX — directed graphs for aircraft rotation / cascade views.
+
+Machine learning / NLP:
+  • scikit-learn — RandomForestClassifier, GradientBoostingClassifier, pipelines,
+    StandardScaler, train/test split, metrics.
+  • sentence-transformers — SentenceTransformer (default: all-MiniLM-L6-v2),
+    cosine similarity via util.pytorch_cos_sim.
+  • xgboost (optional) — XGBClassifier used when import succeeds; otherwise
+    GradientBoostingClassifier substitutes.
+
+Data:                       Pandas, NumPy; CSV upload and optional Flight_Data.csv.
+
+--------------------------------------------------------------------------------
+3. “FRONT END” CHARACTERISTICS (NOT A CLASSIC SPA)
+--------------------------------------------------------------------------------
+Presentation layer is implemented as:
+
+A) Streamlit-native components
+   • st.radio sidebar navigation, st.tabs, st.metric, st.dataframe, st.slider,
+     st.file_uploader, st.expander, st.plotly_chart.
+   • Session state for navigation (e.g., pilot profile drill-down), cached models,
+     and trained artifact reuse.
+
+B) Custom visual design (“blueprint” theme)
+   • Global CSS injected with st.markdown(..., unsafe_allow_html=True): grid
+     background, Bebas Neue + Space Mono typography, flat borders, uppercase
+     tab labels, sidebar styling.
+   • Material Symbols / Google Fonts loaded via link tags in markdown.
+
+C) Embedded HTML + JavaScript (streamlit.components.v1.components.html)
+   • Dashboard hero: split-flap style animation, CTA links using query params
+     (?page=schedule-board, ?page=flight-ops).
+   • Aircraft timeline / Gantt: per-aircraft rows, flight blocks, filters,
+     detail panel (route, times, crew, conflict reason).
+   • Interactive Scheduling Board: drag-and-drop reassignment of flight cards
+     between pilots, real-time “impact” side panel (conflicts, warnings,
+     fatigue-style meters), undo/redo, JavaScript-side conflict detection.
+
+Characteristics relevant to scheduling UX:
+   • Monospace labels and metrics support scanability in ops-style dashboards.
+   • Color semantics: blue = normal, amber = warning, red = conflict / critical.
+   • Heavy use of Plotly indicators (gauges) for “compliance pulse” and fatigue
+     risk index — quick at-a-glance status without reading tables.
+
+--------------------------------------------------------------------------------
+4. HIGH-LEVEL SYSTEM ARCHITECTURE
+--------------------------------------------------------------------------------
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         STREAMLIT PRESENTATION LAYER                         │
+│  Pages: Dashboard | Flight Ops | Crew Manager | Schedule Board | Alerts      │
+│  + Pilot detail (routing) | NLP query + charts | HTML embeds                 │
+└───────────────────────────────────┬─────────────────────────────────────────┘
+                                    │
+        ┌───────────────────────────┼───────────────────────────┐
+        ▼                           ▼                           ▼
+┌───────────────┐         ┌─────────────────┐         ┌─────────────────────┐
+│ DATA INGEST   │         │ ANALYTICS CORE  │         │ ML & NLP SERVICES   │
+│ CSV upload /  │───────▶ │ Pandas frames   │◀─────── │ SBERT embeddings    │
+│ default CSV   │         │ Feature eng.    │         │ RF / XGB / GBM      │
+│ clean_*       │         │ Optimizer,      │         │ Fatigue RF          │
+│               │         │ Tuner, Analyzer │         │ Ensemble predict    │
+└───────────────┘         └────────┬────────┘         └─────────────────────┘
+                                 │
+                    ┌────────────┴────────────┐
+                    ▼                         ▼
+            ┌──────────────┐         ┌──────────────┐
+            │ AIRPORT_CFG  │         │ RULE LAYER   │
+            │ capacities,  │         │ DGCA-style   │
+            │ peak hours   │         │ + decision   │
+            └──────────────┘         └──────────────┘
+
+Key modules / classes in test4.py (conceptual layers):
+
+  • Data cleaning: clean_flight_data_enhanced — parses dates/times, computes
+    delays, turnaround, cascading risk score, binary delay labels.
+
+  • ScheduleTuner — simulates moving a flight’s STD; estimates delay risk change
+    and downstream flights on same tail.
+
+  • CascadingDelayAnalyzer — ranks flights by propagation risk using historical
+    delay, utilization, turnaround tightness, peak hours.
+
+  • EnhancedScheduleOptimizer — builds congestion_df, delay_patterns_df,
+    busiest_slots_df; scores hourly slots; find_optimal_slots_enhanced.
+
+  • PilotFatiguePredictor + DecisionSupportFramework — separate Random Forest
+    trained on synthetic supervised data; combines with hard thresholds.
+
+  • NLP: load_sbert, map_enhanced_query — intent + semantic column/operation
+    hints.
+
+  • train_enhanced_models — delay classification (arrival delay > 15 min) with
+    engineered features.
+
+--------------------------------------------------------------------------------
+5. INFORMATION FLOW (END-TO-END)
+--------------------------------------------------------------------------------
+
+5.1 Flight Ops page (analytics + ML + NLP)
+  1. User uploads CSV or uses Flight_Data.csv / demo synthetic data.
+  2. clean_flight_data_enhanced produces a unified analytic dataframe.
+  3. EnhancedScheduleOptimizer constructs congestion, delay patterns, busiest
+     slots, and embeds ScheduleTuner + CascadingDelayAnalyzer.
+  4. SentenceTransformer encodes column descriptions and operation verbs once;
+     user query is encoded; cosine similarity picks relevant columns/ops.
+  5. Keyword rules layer selects intent: optimize | busiest | tune | cascade |
+     predict | statistics (default).
+  6. Intent handlers call optimizer methods, show Plotly visuals, or run
+     ensemble_predict_enhanced for delay probability.
+  7. Model weights live in st.session_state["enhanced_artifacts"] to avoid
+     retraining every rerun.
+
+5.2 Dashboard / Crew / Board / Alerts (pilot-centric)
+  • load_dashboard_data loads or synthesizes rows with From/To/STD/STA and
+    synthetic Captain, First Officer, Status for Gantt and roster views.
+  • Sidebar “Quick Pilot Lookup” can set session state to open pilot profile
+    (render_pilot_detail_page) with weekly timeline HTML and charts.
+  • Schedule Board injects large HTML/JS string with flight and pilot JSON for
+    drag-and-drop.
+  • Alerts aggregates delayed flights and optional fatigue cards.
+
+--------------------------------------------------------------------------------
+6. MACHINE LEARNING MODELS (DETAIL)
+--------------------------------------------------------------------------------
+
+6.1 Arrival delay binary classifier (operational analytics track)
+  Target: ArrDelayBinary = 1 if ArrDelay > 15 minutes.
+
+  Features (subset used if columns exist):
+    Month, DayOfWeek, DepHour, Distance, AirTime,
+    IsPeakHour (origin in AIRPORT_CONFIG peak list),
+    IsWeekend, HasQuickTurnaround, TurnaroundPressure,
+    Cascading_Risk_Score
+
+  Model A — Random Forest (inside Pipeline):
+    StandardScaler → RandomForestClassifier(
+      n_estimators=150, max_depth=12, min_samples_split=5, n_jobs=-1)
+
+  Model B — XGBoost (if available) or GradientBoosting:
+    XGBClassifier: n_estimators=150, max_depth=6, learning_rate=0.1,
+      subsample=0.8, eval_metric=logloss
+    OR GradientBoostingClassifier with analogous hyperparameters.
+
+  Training: 80/20 stratified split (when two classes exist).
+
+  Ensemble (ensemble_predict_enhanced):
+    Weighted average of positive-class probabilities: 60% RF, 40% model B.
+
+  Role in scheduling: estimates probability of significant arrival delay under
+    user-selected scenario (origin, hour, month, DOW, quick turnaround). This
+    supports “what-if” risk awareness when choosing slots or assessing knock-on
+    effects, not autopilot scheduling.
+
+6.2 Natural language interface (SBERT)
+  Model: SentenceTransformer "all-MiniLM-L6-v2" (384-dim embeddings, compact
+    and fast for semantic similarity).
+
+  Mechanism:
+    • Pre-encode descriptions for dataset columns (ENHANCED_COLUMN_DESCRIPTIONS)
+      and analytic operations (ENHANCED_OPERATIONS).
+    • Encode user query; cosine similarity ranks columns (threshold ~0.28) and
+      operations (threshold ~0.22).
+    • Intent is primarily keyword-driven on top of embeddings for reliability.
+
+  Role: routes the user to the correct handler and optionally focuses stats on
+    the most semantically relevant column.
+
+6.3 Pilot fatigue classifier (crew track)
+  Model: RandomForestClassifier(n_estimators=100, max_depth=5, random_state=42).
+
+  Training data: SYNTHETIC — 1000 samples; features drawn uniformly:
+    avg_flight_hours (2–12), duty_to_rest_ratio (0.5–3.0), workload_index (20–100).
+    Labels generated by deterministic rules mimicking risk bands (Efficient /
+    Moderate / Critical).
+
+  Inference outputs: class 0/1/2 and predict_proba; UI emphasizes P(Critical) as a
+    “Fatigue Risk Index” gauge.
+
+  Important limitation: not trained on real biometric or roster data; suitable
+    for UI demonstration and hybrid rule+ML workflow testing.
+
+6.4 DecisionSupportFramework (non-ML rules)
+  Hard rejects (examples): flight hours > 10, duty-to-rest ratio > 2.5.
+  Combines with ML tiers: Critical / Review Required / Approved.
+
+  DGCA references in UI (12h duty, 8h rest equivalence via ratio, 60h/week) are
+  simplified checks for display — not legal compliance certification.
+
+--------------------------------------------------------------------------------
+7. DETERMINISTIC / OR LOGIC (SCHEDULING & OPTIMIZATION)
+--------------------------------------------------------------------------------
+
+7.1 AIRPORT_CONFIG
+  Per airport: runways, capacity_per_hour, peak_hours, weather_delays,
+  ground_congestion. Used to scale utilization and mark peak periods.
+
+7.2 Congestion and delay scoring
+  Hourly utilization vs capacity → CongestionLevel with peak and weather
+  multipliers. Delay patterns aggregate historical DepDelay/ArrDelay stats.
+  Optimal slot score blends congestion, delay risk, cascading risk.
+
+7.3 CascadingDelayAnalyzer impact score (per flight)
+  Weighted blend of: historical delay rate at origin/hour, aircraft utilization
+  intensity, turnaround pressure, peak-hour bonus. Capped at 1.0; categorical
+  risk labels (HIGH / MEDIUM / …).
+
+7.4 ScheduleTuner
+  Shifts STD; recomputes delay risk for new hour; counts downstream flights on
+  same registration potentially affected when shift exceeds turnaround buffer.
+
+Advantages of this hybrid approach:
+  • Interpretable factors (capacity, peak hours) align with how dispatchers
+    reason about congestion.
+  • ML adds non-linear delay prediction from rich features including rotation
+    stress.
+  • SBERT lowers the barrier to analytics for users who do not know column
+    names.
+  • Rule layer ensures certain unsafe crew inputs are blocked regardless of ML
+    noise.
+
+--------------------------------------------------------------------------------
+8. OUTPUT COMPONENTS (USER-VISIBLE ARTIFACTS)
+--------------------------------------------------------------------------------
+
+8.1 Metrics and KPIs
+  • Flight counts, airport counts, average cascading risk, high-risk flight counts.
+
+8.2 Tables
+  • Raw preview, busiest slots, cascading impact leaderboard, airport aggregates.
+
+8.3 Plotly figures
+  • Congestion heatmaps (airport × hour).
+  • Delay pattern bar charts (faceted by airport).
+  • Network graph (spring layout) for high-impact rotation edges.
+  • Optimization score bar charts, schedule tuning multi-panel figures.
+  • Histograms for statistical queries.
+  • Gauges: compliance pulse, fatigue risk index.
+
+8.4 NLP-driven panels
+  • Detected intent banner, contextual forms (airport pickers, sliders), results.
+
+8.5 Embedded UIs
+  • Hero animation, aircraft day timeline, interactive pilot board with impact
+    sidebar.
+
+8.6 Pilot profile
+  • Pie/bar charts for hours, currency card (demo), weekly duty strip.
+
+--------------------------------------------------------------------------------
+9. APPLICATION ENTRY AND DEPENDENCIES
+--------------------------------------------------------------------------------
+Run (typical):
+  streamlit run test4.py
+
+requirements.txt includes:
+  numpy, pandas, matplotlib, seaborn, scikit-learn, sentence-transformers,
+  xgboost, streamlit
+
+First SBERT download may require network access to fetch model weights.
+
+--------------------------------------------------------------------------------
+10. REPOSITORY FILES (BRIEF)
+--------------------------------------------------------------------------------
+  test4.py          — Main integrated Streamlit application described here.
+  app.py, app1.py,
+  test.py, etc.     — Alternate/earlier implementations; README may still refer
+                      to app.py for a simpler flight-optimizer narrative.
+  README.md         — High-level feature list and generic architecture.
+  requirements.txt  — Python dependencies.
+  debug_*.py/html   — Development/debug artifacts.
+
+--------------------------------------------------------------------------------
+11. SUMMARY TABLE: MODEL VS ROLE
+--------------------------------------------------------------------------------
+┌────────────────────────────┬───────────────────────────────────────────────┐
+│ Component                  │ Role                                           │
+├────────────────────────────┼───────────────────────────────────────────────┤
+│ SBERT (MiniLM)             │ Semantic query ↔ column/operation matching     │
+│ RF + XGB/GBM               │ Arrival delay >15min probability (ensemble)    │
+│ RF (fatigue)               │ 3-class fatigue from synthetic crew features   │
+│ Rules (DecisionSupport)    │ Hard crew limits + merge with ML fatigue tier  │
+│ Graph / scoring heuristics │ Congestion, cascading, slot ranking, tuning sim │
+└────────────────────────────┴───────────────────────────────────────────────┘
+
+================================================================================
+END OF DOCUMENT
+================================================================================

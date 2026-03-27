@@ -1,0 +1,105 @@
+================================================================================
+SYSTEM INFO — FLIGHT SCHEDULE OPTIMIZER / PILOT SCHEDULER
+================================================================================
+
+Project Name:
+  Flight_Schedule_Optimizer-main
+
+Primary Runtime Environment:
+  - Language: Python 3.x
+  - Main app framework: Streamlit
+  - Main application file in active integrated build: test4.py
+
+Core Dependency Stack (requirements.txt):
+  - numpy
+  - pandas
+  - matplotlib
+  - seaborn
+  - scikit-learn
+  - sentence-transformers
+  - xgboost
+  - streamlit
+
+System Architecture Type:
+  - Monolithic Python analytics app with Streamlit UI.
+  - No separate frontend framework build pipeline (no React/Vue package app).
+  - Frontend behavior is produced by:
+      1) Streamlit native widgets/components
+      2) Injected CSS/HTML
+      3) Embedded JavaScript via streamlit.components.v1
+
+Primary Functional Subsystems:
+  1. Data Ingestion and Cleaning
+     - CSV upload + optional default dataset loading
+     - Feature engineering for delays, time, turnaround, and cascade risk
+
+  2. Optimization and Analytics Engine
+     - EnhancedScheduleOptimizer
+     - Congestion scoring by airport/hour and capacity
+     - Delay pattern analysis
+     - Busiest slot and optimal slot recommendation logic
+
+  3. Cascading Delay Engine
+     - ScheduleTuner simulates departure-time shifts
+     - CascadingDelayAnalyzer ranks high-impact flights
+     - Network-based aircraft rotation analysis (NetworkX)
+
+  4. NLP Query Layer
+     - SBERT (all-MiniLM-L6-v2) for semantic matching
+     - Intent routing: optimize, busiest, tune, cascade, predict, statistics
+
+  5. ML Prediction Layer
+     - Delay prediction model: RandomForest + XGBoost/GradientBoosting ensemble
+     - Weighted probability combination for final delay risk
+
+  6. Crew/Fatigue Decision Support
+     - Synthetic-data RandomForest fatigue classifier
+     - Rule-based safety checks (duty/rest thresholds)
+     - Combined recommendation output (approved/review/critical/rejected)
+
+Main UI Pages (from test4.py):
+  - Dashboard
+  - Flight Ops
+  - Crew Manager
+  - Schedule Board
+  - Alerts
+
+Major Output Components:
+  - KPI cards (metrics)
+  - Interactive tables
+  - Plotly charts (heatmaps, bars, gauges)
+  - Cascading impact visualizations
+  - Drag-and-drop scheduling board (embedded HTML/JS)
+  - Pilot profile and timeline views
+
+Data Flow Summary:
+  Input CSV -> clean/engineer features -> analytics + optimizer + models ->
+  NLP/intent mapping -> page handler -> visual outputs + recommendations
+
+ML Model Inventory Summary:
+  - NLP model:
+      SentenceTransformer(all-MiniLM-L6-v2)
+  - Delay classifier models:
+      RandomForestClassifier + XGBClassifier (fallback: GradientBoostingClassifier)
+  - Fatigue model:
+      RandomForestClassifier trained on synthetic generated crew-risk data
+
+Notable Design Characteristics:
+  - High-visibility operational dashboard style (blueprint-like visual theme)
+  - Heavy usage of session state and caching for interactivity/performance
+  - Hybrid intelligence approach:
+      deterministic rules + statistical analytics + ML + semantic NLP
+
+Operational Notes:
+  - XGBoost is optional at runtime; fallback model is used if unavailable.
+  - SBERT model loading may require first-time model download.
+  - DGCA/compliance checks shown in UI are demonstration logic, not official
+    regulatory certification tooling.
+
+Documentation Files in Project Root:
+  - PROJECT_DOCUMENTATION.txt  (detailed architecture and model document)
+  - system info.txt            (this concise system profile)
+
+================================================================================
+END OF SYSTEM INFO
+================================================================================
