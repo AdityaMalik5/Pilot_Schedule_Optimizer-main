@@ -43,6 +43,163 @@ except ImportError:
 
 
 # ------------------------------
+# Shared Data Canonicalization
+# ------------------------------
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Map common CSV variants to a canonical schema used across pages."""
+    out = df.copy()
+    out.columns = [str(c).strip() for c in out.columns]
+    if out.columns.duplicated().any():
+        out = out.loc[:, ~out.columns.duplicated()].copy()
+    lower_to_actual = {str(c).lower().strip(): c for c in out.columns}
+
+    alias_groups = {
+        "Flight Number": ["flight number", "flight_no", "flight no", "flightnumber", "leg_nb", "flight id"],
+        "From": ["from", "origin", "origin airport", "airport_dep", "dep_airport", "departure airport"],
+        "To": ["to", "destination", "dest", "airport_arr", "arr_airport", "arrival airport"],
+        "Unnamed: 2": ["date", "flight_date", "date_dep", "departure date"],
+        "STD": ["std", "scheduled departure", "scheduled_dep", "hour_dep", "dep time", "departure time"],
+        "STA": ["sta", "scheduled arrival", "scheduled_arr", "hour_arr", "arr time", "arrival time"],
+        "ATD": ["atd", "actual departure", "actual_dep"],
+        "ATA": ["ata", "actual arrival", "actual_arr"],
+        "Flight time": ["flight time", "flight_time", "duration", "block_time"],
+        "Aircraft": ["aircraft", "aircraft registration", "tail", "tail number", "aircraft_reg"],
+        "UniqueCarrier": ["carrier", "airline", "airline code", "uniquecarrier"],
+        "S.No": ["s.no", "s no", "serial", "serial number"],
+        "Status": ["status", "flight status"],
+    }
+
+    rename_cols = {}
+    for target, aliases in alias_groups.items():
+        if target in out.columns:
+            continue
+        for alias in aliases:
+            if alias in lower_to_actual:
+                rename_cols[lower_to_actual[alias]] = target
+                break
+    if rename_cols:
+        out.rename(columns=rename_cols, inplace=True)
+
+    # If a separate date + time format exists, synthesize expected strings.
+    if "Unnamed: 2" in out.columns and "STD" not in out.columns and "hour_dep" in lower_to_actual:
+        out["STD"] = out[lower_to_actual["hour_dep"]].astype(str)
+    if "STA" not in out.columns and "hour_arr" in lower_to_actual:
+        out["STA"] = out[lower_to_actual["hour_arr"]].astype(str)
+
+    # Normalize route labels for airport code extraction.
+    if "From" in out.columns:
+        out["From"] = out["From"].astype(str).str.strip().apply(
+            lambda x: x if "(" in x and ")" in x else f"Airport ({x.upper()})"
+        )
+    if "To" in out.columns:
+        out["To"] = out["To"].astype(str).str.strip().apply(
+            lambda x: x if "(" in x and ")" in x else f"Airport ({x.upper()})"
+        )
+
+    if "Flight Number" not in out.columns:
+        out["Flight Number"] = [f"UNK{i+1:05d}" for i in range(len(out))]
+    if "S.No" not in out.columns:
+        out["S.No"] = np.arange(1, len(out) + 1)
+    if "Status" not in out.columns:
+        out["Status"] = "On Time"
+
+    return out
+
+
+def get_active_df_for_views() -> pd.DataFrame:
+    """Return optimized data if applied, otherwise master data."""
+    if st.session_state.get("optimization_applied") and "master_df" in st.session_state:
+        return st.session_state["master_df"].copy()
+    if "master_df" in st.session_state:
+        return st.session_state["master_df"].copy()
+    return pd.DataFrame()
+
+
+def propose_optimized_schedule(master_df: pd.DataFrame, max_shift_minutes: int = 30) -> pd.DataFrame:
+    """
+    Create a proposed optimized schedule from master_df.
+    Uses existing optimizer signals and applies bounded, explainable shifts.
+    """
+    df = normalize_columns(master_df).copy()
+    if df.columns.duplicated().any():
+        df = df.loc[:, ~df.columns.duplicated()].copy()
+    if df.empty:
+        return df
+
+    if "Date" not in df.columns and "Unnamed: 2" in df.columns:
+        df["Date"] = df["Unnamed: 2"]
+    if "Date" not in df.columns:
+        df["Date"] = pd.Timestamp.now().strftime("%d-%b-%y")
+
+    df["Date_dt"] = pd.to_datetime(df["Date"], format="%d-%b-%y", errors="coerce")
+    df["STD_dt"] = pd.to_datetime(df["Date_dt"].dt.strftime("%Y-%m-%d") + " " + df["STD"].astype(str), errors="coerce")
+    df["STA_dt"] = pd.to_datetime(df["Date_dt"].dt.strftime("%Y-%m-%d") + " " + df["STA"].astype(str), errors="coerce")
+    df["STA_dt"] = df["STA_dt"].where(df["STA_dt"] >= df["STD_dt"], df["STA_dt"] + pd.Timedelta(days=1))
+
+    for col in ["Captain", "First Officer", "Status"]:
+        if col not in df.columns:
+            df[col] = "N/A"
+
+    clean_df = clean_flight_data_enhanced(df.copy())
+    optimizer = EnhancedScheduleOptimizer(clean_df)
+
+    # Build congestion lookup (airport, hour) -> congestion level
+    congestion_lookup = {}
+    if hasattr(optimizer, "congestion_df") and not optimizer.congestion_df.empty:
+        for _, r in optimizer.congestion_df.iterrows():
+            congestion_lookup[(str(r["Airport"]), int(r["Hour"]))] = float(r["CongestionLevel"])
+
+    proposed = df.copy()
+    proposed["Orig_STD"] = proposed["STD"].astype(str)
+    proposed["Orig_STA"] = proposed["STA"].astype(str)
+    proposed["Change_Reason"] = ""
+    proposed["Risk_Reduction_%"] = 0.0
+
+    # Crew daily load for simple reassignment (hours)
+    proposed["DateKey"] = proposed["Date_dt"].dt.strftime("%Y-%m-%d")
+    proposed["DurationHrs"] = ((proposed["STA_dt"] - proposed["STD_dt"]).dt.total_seconds() / 3600).fillna(1.5).clip(0.5, 6)
+
+    crew_load = proposed.groupby(["Captain", "DateKey"])["DurationHrs"].sum().to_dict()
+    captains = [c for c in proposed["Captain"].dropna().unique().tolist() if str(c).strip() and str(c) != "N/A"]
+
+    for idx, row in proposed.iterrows():
+        origin_code = str(row.get("From", "UNK"))
+        origin_code = origin_code.split("(")[-1].split(")")[0].strip().upper() if "(" in origin_code else origin_code
+        dep_hour = int(row["STD_dt"].hour) if pd.notna(row["STD_dt"]) else 0
+        congestion = congestion_lookup.get((origin_code, dep_hour), 0.0)
+        is_delayed = str(row.get("Status", "")).lower() == "delayed"
+
+        if congestion >= 0.7 or is_delayed:
+            shift = min(max_shift_minutes, 30 if congestion >= 0.85 else 15)
+            proposed.at[idx, "STD_dt"] = row["STD_dt"] + pd.Timedelta(minutes=shift)
+            proposed.at[idx, "STA_dt"] = row["STA_dt"] + pd.Timedelta(minutes=shift)
+            proposed.at[idx, "Change_Reason"] = f"Congestion-adjusted slot (+{shift}m)"
+            proposed.at[idx, "Risk_Reduction_%"] = round(min(40.0, congestion * 35 + (10 if is_delayed else 0)), 1)
+
+        # Crew reassignment when captain daily duty exceeds 12h
+        cap = str(row.get("Captain", "N/A"))
+        dkey = row.get("DateKey", "")
+        if crew_load.get((cap, dkey), 0) > 12 and captains:
+            alt = min(captains, key=lambda c: crew_load.get((c, dkey), 0))
+            if alt != cap:
+                proposed.at[idx, "Captain"] = alt
+                crew_load[(cap, dkey)] = max(0, crew_load.get((cap, dkey), 0) - row["DurationHrs"])
+                crew_load[(alt, dkey)] = crew_load.get((alt, dkey), 0) + row["DurationHrs"]
+                reason = proposed.at[idx, "Change_Reason"]
+                proposed.at[idx, "Change_Reason"] = (reason + "; " if reason else "") + f"Crew rebalance ({cap}→{alt})"
+
+    proposed["STD"] = proposed["STD_dt"].dt.strftime("%I:%M %p")
+    proposed["STA"] = proposed["STA_dt"].dt.strftime("%I:%M %p")
+    proposed["Optimization_Changed"] = (
+        (proposed["Orig_STD"] != proposed["STD"]) |
+        (proposed["Orig_STA"] != proposed["STA"]) |
+        (proposed["Change_Reason"].astype(str) != "")
+    )
+
+    return proposed.drop(columns=["Date_dt", "DateKey", "DurationHrs"], errors="ignore")
+
+
+# ------------------------------
 # ENHANCED Data Cleaning with Aircraft Tracking
 # ------------------------------
 @st.cache_data(show_spinner="Processing and cleaning flight data with aircraft tracking...")
@@ -50,24 +207,9 @@ def clean_flight_data_enhanced(df: pd.DataFrame) -> pd.DataFrame:
     """
     Enhanced data cleaning with aircraft rotation and cascading analysis support
     """
-    # Normalize incoming column names and handle common aliases from uploaded files.
-    df.columns = [str(c).strip() for c in df.columns]
-    alias_map = {
-        "flight_number": "Flight Number",
-        "flight no": "Flight Number",
-        "flight_no": "Flight Number",
-        "flightnumber": "Flight Number",
-        "flight": "Flight Number",
-        "leg_nb": "Flight Number",
-        "s.no": "S.No",
-    }
-    lower_to_actual = {str(c).lower(): c for c in df.columns}
-    rename_cols = {}
-    for src_lc, target in alias_map.items():
-        if target not in df.columns and src_lc in lower_to_actual:
-            rename_cols[lower_to_actual[src_lc]] = target
-    if rename_cols:
-        df.rename(columns=rename_cols, inplace=True)
+    df = normalize_columns(df)
+    if df.columns.duplicated().any():
+        df = df.loc[:, ~df.columns.duplicated()].copy()
 
     # Ensure required ID columns exist to avoid KeyError on uploads with slightly
     # different schemas.
@@ -80,12 +222,20 @@ def clean_flight_data_enhanced(df: pd.DataFrame) -> pd.DataFrame:
     df['Flight Number'].ffill(inplace=True)
     df['S.No'].ffill(inplace=True)
 
+    # Date column harmonization without creating duplicate Date keys
+    if "Date" in df.columns and "Unnamed: 2" in df.columns:
+        # Prefer explicit Date and drop legacy alias to avoid duplicate-key assembly.
+        df.drop(columns=["Unnamed: 2"], inplace=True, errors="ignore")
+    elif "Date" not in df.columns and "Unnamed: 2" in df.columns:
+        df.rename(columns={"Unnamed: 2": "Date"}, inplace=True)
+    elif "Date" not in df.columns:
+        df["Date"] = pd.Timestamp.now().strftime("%d-%b-%y")
+
     # Drop rows where essential data is missing
-    df.dropna(subset=['Unnamed: 2', 'From', 'To'], inplace=True)
+    df.dropna(subset=['Date', 'From', 'To'], inplace=True)
 
     # Rename columns for clarity
     df.rename(columns={
-        'Unnamed: 2': 'Date',
         'From': 'Origin_City',
         'To': 'Dest_City',
         'Flight time': 'FlightTime'
@@ -1085,40 +1235,15 @@ def render_pilot_fatigue_dashboard():
 # Enhanced Main Application
 # ------------------------------
 def load_dashboard_data():
-    # Lightweight data loader for the landing-page dashboard.
-    # Does NOT call clean_flight_data_enhanced (which renames/drops columns
-    # the dashboard needs like From, To, STD, STA).
+    # Dashboard/Schedule views must read only from active master_df.
     import random
     random.seed(42)
-    
-    # Prefer the active dataset uploaded in Flight Ops so all pages share
-    # the same working data (Dashboard / Schedule Board / Quick Lookup).
-    if "shared_dashboard_df" in st.session_state:
-        df = st.session_state["shared_dashboard_df"].copy()
-    else:
-        default_file = "Flight_Data.csv"
-        if os.path.exists(default_file):
-            df = pd.read_csv(default_file)
-            # Minimal rename - keep From/To intact for the Gantt chart
-            if 'Unnamed: 2' in df.columns:
-                df.rename(columns={'Unnamed: 2': 'Date'}, inplace=True)
-            drop_subset = [c for c in ['Date', 'From', 'To'] if c in df.columns]
-            if drop_subset:
-                df.dropna(subset=drop_subset, inplace=True)
-        else:
-            dates = pd.date_range(start='2024-01-01', periods=100)
-            df = pd.DataFrame({
-                'Date': dates.strftime('%d-%b-%y'),
-                'From': np.random.choice(['Delhi (DEL)', 'Mumbai (BOM)', 'Bangalore (BLR)'], 100),
-                'To': np.random.choice(['Bhubaneswar (BBI)', 'Hyderabad (HYD)', 'Kolkata (CCU)'], 100),
-                'Flight time': ['02:15'] * 100,
-                'Aircraft': np.random.choice(['VT-ABC', 'VT-XYZ', 'VT-DEF', 'VT-LMN'], 100),
-                'STD': ['10:00 AM'] * 50 + ['02:00 PM'] * 50,
-                'ATD': ['10:15 AM'] * 50 + ['02:30 PM'] * 50,
-                'STA': ['12:15 PM'] * 50 + ['04:15 PM'] * 50,
-                'ATA': ['Landed 12:30 PM'] * 50 + ['Delayed 04:45 PM'] * 50,
-                'Flight Number': [f'AI{100+i}' for i in range(100)],
-            })
+
+    df = get_active_df_for_views()
+    if df.empty:
+        return pd.DataFrame()
+
+    df = normalize_columns(df)
     
     # Parse Date robustly for multiple source schemas
     if 'Date' not in df.columns and 'Unnamed: 2' in df.columns:
@@ -1132,7 +1257,7 @@ def load_dashboard_data():
     df['Date'] = df['Date'].fillna(pd.Timestamp.now())
     
     # Ensure required columns exist with safe defaults
-    for col in ['STD', 'STA', 'Aircraft', 'Flight Number']:
+    for col in ['STD', 'STA', 'Aircraft', 'Flight Number', 'From', 'To']:
         if col not in df.columns:
             df[col] = 'N/A'
     
@@ -1639,6 +1764,56 @@ def render_scheduling_board():
     import json
 
     df_dash = load_dashboard_data()
+    if df_dash.empty:
+        st.info("Upload a flight CSV to populate this view.")
+        return
+
+    # Optimization controls (proposal vs confirm/discard)
+    c1, c2, c3 = st.columns([1.5, 1.2, 1.2])
+    with c1:
+        if st.button("✦ Optimize Schedule", key="optimize_schedule_board", use_container_width=True):
+            st.session_state["optimized_df"] = propose_optimized_schedule(
+                st.session_state.get("master_df", df_dash),
+                max_shift_minutes=60
+            )
+            st.success("Optimization proposal generated. Review and confirm to apply globally.")
+    with c2:
+        if st.button("✔ Confirm & Apply Optimization", key="confirm_schedule_opt", use_container_width=True):
+            if "optimized_df" in st.session_state and not st.session_state["optimized_df"].empty:
+                opt_df = st.session_state["optimized_df"].copy()
+                remaining_flags = int(
+                    ((opt_df.get("Risk_Reduction_%", 0) <= 0).astype(int).sum())
+                    if "Risk_Reduction_%" in opt_df.columns else 0
+                )
+                if remaining_flags > 0:
+                    st.warning("Optimization has been applied with active warnings. Review conflict and fatigue rows in the board.")
+                st.session_state["master_df"] = st.session_state["optimized_df"].copy()
+                st.session_state.pop("optimized_df", None)
+                st.session_state["optimization_applied"] = True
+                st.success("Optimization applied. All views have been updated.")
+                st.rerun()
+    with c3:
+        if st.button("✘ Discard", key="discard_schedule_opt", use_container_width=True):
+            st.session_state.pop("optimized_df", None)
+            st.info("Optimization proposal discarded.")
+
+    if "optimized_df" in st.session_state and not st.session_state["optimized_df"].empty:
+        cmp_tabs = st.tabs(["Current Schedule", "Optimized Schedule"])
+        with cmp_tabs[0]:
+            st.dataframe(
+                df_dash[["Flight Number", "From", "To", "STD", "STA", "Captain", "Status"]].head(40),
+                use_container_width=True,
+                hide_index=True
+            )
+        with cmp_tabs[1]:
+            optv = st.session_state["optimized_df"].copy()
+            st.dataframe(
+                optv[["Flight Number", "From", "To", "Orig_STD", "STD", "Orig_STA", "STA", "Captain", "Change_Reason", "Risk_Reduction_%"]]
+                .head(40),
+                use_container_width=True,
+                hide_index=True
+            )
+        st.markdown("---")
 
     # Build flight data for the JS board
     flights_data = []
@@ -1667,7 +1842,7 @@ def render_scheduling_board():
 <style>
 * { margin:0; padding:0; box-sizing:border-box; }
 body { font-family:'Space Mono',monospace; background:#f8fafc; color:#0f172a; }
-.app-layout { display:grid; grid-template-columns:65fr 35fr; gap:1.2rem; padding:1rem; min-height:580px; }
+.app-layout { display:grid; grid-template-columns:70fr 30fr; gap:1.2rem; padding:1rem; min-height:760px; }
 .main-col { min-width:0; }
 .toolbar { display:flex; gap:0.5rem; margin-bottom:1rem; align-items:center; flex-wrap:wrap; background:white; border:1px solid #e2e8f0; padding:0.6rem 0.8rem; }
 .toolbar button { color:#0f172a; padding:0.4rem 0.85rem; border:1px solid #e2e8f0; background:white; border-radius:0; cursor:pointer; font-size:0.75rem; font-family:'Space Mono',monospace; font-weight:700; letter-spacing:0.02em; transition:background-color 0.15s ease, color 0.15s ease, border-color 0.15s ease; }
@@ -1679,11 +1854,11 @@ body { font-family:'Space Mono',monospace; background:#f8fafc; color:#0f172a; }
 .legend { display:flex; gap:1.2rem; margin-bottom:0.8rem; font-size:0.7rem; letter-spacing:0.02em; color:#64748b; }
 .legend span { display:flex; align-items:center; gap:0.35rem; }
 .legend .dot { width:12px; height:12px; }
-.board { display:grid; grid-template-columns:120px 1fr; border:1px solid #e2e8f0; overflow:hidden; background:white; }
-.pilot-label { padding:0.55rem 0.6rem; background:#f1f5f9; border-bottom:1px solid #e2e8f0; font-weight:700; font-size:0.72rem; display:flex; align-items:center; gap:0.3rem; min-height:72px; font-family:'Space Mono',monospace; letter-spacing:-0.01em; word-break:break-word; color:#0f172a; }
+.board { display:grid; grid-template-columns:140px 1fr; border:1px solid #e2e8f0; overflow:hidden; background:white; }
+.pilot-label { padding:0.65rem 0.7rem; background:#f1f5f9; border-bottom:1px solid #e2e8f0; font-weight:700; font-size:0.8rem; display:flex; align-items:center; gap:0.3rem; min-height:88px; font-family:'Space Mono',monospace; letter-spacing:-0.01em; word-break:break-word; color:#0f172a; }
 .pilot-label.affected { background:#fef3c7; border-left:3px solid #f59e0b; }
 .pilot-label.conflict-row { background:#fee2e2; border-left:3px solid #ef4444; }
-.pilot-row { position:relative; padding:0.35rem 0.5rem; border-bottom:1px solid #e2e8f0; display:flex; flex-wrap:wrap; gap:0.4rem; min-height:72px; align-items:center; transition:background-color 0.15s ease; }
+.pilot-row { position:relative; padding:0.45rem 0.6rem; border-bottom:1px solid #e2e8f0; display:flex; flex-wrap:wrap; gap:0.5rem; min-height:88px; align-items:center; transition:background-color 0.15s ease; }
 .row-bg { position:absolute; inset:0; z-index:0; transition:background-color 0.15s ease; }
 .pilot-row:hover .row-bg { background-color:#eff6ff; }
 .pilot-row.drag-over .row-bg { background-color:#dbeafe; }
@@ -1691,15 +1866,15 @@ body { font-family:'Space Mono',monospace; background:#f8fafc; color:#0f172a; }
 @keyframes pulseAmber { 0%,100% { box-shadow:inset 0 0 0 2px rgba(245,158,11,0.5); } 50% { box-shadow:inset 0 0 0 2px rgba(245,158,11,0); } }
 .pilot-row.row-warning .row-bg { animation: pulseAmber 2s infinite; }
 .pilot-row.row-conflict .row-bg { box-shadow:inset 0 0 0 2px #ef4444; }
-.flight-card { position:relative; z-index:2; width:140px; height:60px; padding:0.35rem 0.55rem; border-radius:0; font-size:0.68rem; cursor:grab; user-select:none; border:2px solid transparent; transition:background-color 0.15s ease, outline 0.15s ease, transform 0.15s ease; outline:2px solid transparent; display:flex; flex-direction:column; justify-content:center; overflow:hidden; font-family:'Space Mono',monospace; }
+.flight-card { position:relative; z-index:2; width:172px; height:72px; padding:0.45rem 0.65rem; border-radius:0; font-size:0.76rem; cursor:grab; user-select:none; border:2px solid transparent; transition:background-color 0.15s ease, outline 0.15s ease, transform 0.15s ease; outline:2px solid transparent; display:flex; flex-direction:column; justify-content:center; overflow:hidden; font-family:'Space Mono',monospace; }
 .flight-card:hover { outline:2px solid #bfdbfe; outline-offset:2px; z-index:10; }
 .flight-card.dragging { opacity:0.5; outline:2px dashed #3b82f6; }
 .flight-card:active { cursor:grabbing; transform:scale(1.06); box-shadow:0 6px 20px rgb(0 0 0/0.18); }
-.flight-card .fid { font-weight:700; font-size:0.76rem; line-height:1.2; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-.flight-card .froute { font-size:0.62rem; line-height:1.3; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; opacity:0.8; }
+.flight-card .fid { font-weight:700; font-size:0.86rem; line-height:1.2; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.flight-card .froute { font-size:0.7rem; line-height:1.3; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; opacity:0.85; }
 .card-green  { background:#10b981; border-color:#059669; color:#14532d; }
 .card-amber  { background:#f59e0b; border-color:#d97706; color:#78350f; }
-.card-red    { background:#ef4444; border-color:#dc2626; color:#7f1d1d; }
+.card-red    { background:#fff1f2; border-color:#dc2626; color:#7f1d1d; box-shadow: inset 0 0 0 2px rgba(220,38,38,0.25); }
 .card-blue   { background:#dbeafe; border-color:#3b82f6; color:#0f172a; }
 @keyframes cardPulse { 0%,100% { box-shadow:0 0 0 0 rgba(16,185,129,0.45); } 50% { box-shadow:0 0 0 6px rgba(16,185,129,0); } }
 .flight-card.changed { animation: cardPulse 1.6s infinite; }
@@ -1963,7 +2138,7 @@ renderBoard();
     st.markdown("# \u2708\ufe0f Interactive Scheduling Board")
     st.markdown("Drag flight cards between pilots to reassign duties. The **Impact Dashboard** updates in real-time.")
     st.markdown("---")
-    components.html(board_html, height=700, scrolling=True)
+    components.html(board_html, height=860, scrolling=True)
 
 
 def main():
@@ -2033,6 +2208,8 @@ def main():
         </div>
         <hr style="border:none; border-top:1px solid #e2e8f0; margin:0 0 0.5rem 0;">
         """, unsafe_allow_html=True)
+        if st.session_state.get("optimization_applied"):
+            st.success("🟢 Optimized schedule active")
 
         page = st.radio(
             "Navigation",
@@ -2045,15 +2222,18 @@ def main():
 
         # Quick pilot lookup in sidebar
         df_dash = load_dashboard_data()
-        all_pilots = sorted(set(df_dash['Captain'].unique().tolist() + df_dash['First Officer'].unique().tolist()))
         st.markdown("<div style='font-size:0.65rem; color:#94a3b8; text-transform:uppercase; letter-spacing:0.1em; margin-bottom:0.3rem; font-family:\"Space Mono\",monospace;'>Quick Pilot Lookup</div>", unsafe_allow_html=True)
-        selected_pilot = st.selectbox(
-            "Pilot",
-            ["— Select —"] + all_pilots,
-            key="quick_pilot_lookup",
-            label_visibility="collapsed",
-            on_change=_on_quick_pilot_change,
-        )
+        if df_dash.empty:
+            st.info("Upload a flight CSV to populate this view.")
+        else:
+            all_pilots = sorted(set(df_dash['Captain'].unique().tolist() + df_dash['First Officer'].unique().tolist()))
+            selected_pilot = st.selectbox(
+                "Pilot",
+                ["— Select —"] + all_pilots,
+                key="quick_pilot_lookup",
+                label_visibility="collapsed",
+                on_change=_on_quick_pilot_change,
+            )
 
     # ─── GLOBAL ROUTING INTERCEPTS ───
     # 1. Sidebar dropdown / gantt click target
@@ -2158,6 +2338,10 @@ def main():
         """
         components.html(hero_html, height=350, scrolling=False)
 
+        if df_dash.empty:
+            st.info("Upload a flight CSV to populate this view.")
+            st.stop()
+
         # --- KPI Row ---
         active_flights = len(df_dash[df_dash['Status'].isin(['On Time', 'Boarding'])])
         total_pilots = len(df_dash['Captain'].unique()) + len(df_dash['First Officer'].unique())
@@ -2172,39 +2356,46 @@ def main():
 
         st.markdown("<br>", unsafe_allow_html=True)
 
-        # --- Recent Flights Cards ---
+        # --- Recent Flights (Live CSV) ---
         st.markdown("""
         <div style="margin-top:0.5rem;">
             <span style="color:#3b82f6; font-size:0.7rem; text-transform:uppercase; letter-spacing:0.3em; font-weight:700; font-family:'Space Mono',monospace;">01 / FLIGHT LOGS</span>
             <h2 style="font-family:'Bebas Neue',sans-serif; font-size:3rem; color:#0f172a; margin:0.3rem 0 0 0;">RECENT FLIGHTS</h2>
         </div>
-        <div style="display:flex; gap:1.5rem; overflow-x:auto; padding:1.5rem 0; scrollbar-width:none;">
-            <div style="min-width:250px; background:white; padding:1.8rem; border:1px solid #e2e8f0; position:relative; transition:transform 0.3s;">
-                <div style="display:flex; justify-content:space-between; font-size:0.65rem; text-transform:uppercase; letter-spacing:0.1em; color:#94a3b8; margin-bottom:1.2rem; font-family:'Space Mono',monospace;"><span>No. 01</span><span>02.28.2026</span></div>
-                <div style="font-size:2rem; color:#0f172a; font-family:'Bebas Neue',sans-serif; margin-bottom:0.6rem;">BBI → JRG</div>
-                <div style="width:40px; height:1px; background:#3b82f6; margin-bottom:1rem;"></div>
-                <div style="font-size:0.72rem; color:#64748b; line-height:1.6; font-family:'Space Mono',monospace;">C172. 2.1h Total Time. Day VFR<br>Local PIC.</div>
-            </div>
-            <div style="min-width:250px; background:white; padding:1.8rem; border:1px solid #e2e8f0; position:relative; transition:transform 0.3s;">
-                <div style="display:flex; justify-content:space-between; font-size:0.65rem; text-transform:uppercase; letter-spacing:0.1em; color:#94a3b8; margin-bottom:1.2rem; font-family:'Space Mono',monospace;"><span>No. 02</span><span>02.21.2026</span></div>
-                <div style="font-size:2rem; color:#0f172a; font-family:'Bebas Neue',sans-serif; margin-bottom:0.6rem;">DEL → BOM</div>
-                <div style="width:40px; height:1px; background:#3b82f6; margin-bottom:1rem;"></div>
-                <div style="font-size:0.72rem; color:#64748b; line-height:1.6; font-family:'Space Mono',monospace;">PA28. 1.1h Total Time. Day IFR<br>Cross-Country PIC.</div>
-            </div>
-            <div style="min-width:250px; background:white; padding:1.8rem; border:1px solid #e2e8f0; position:relative; transition:transform 0.3s;">
-                <div style="display:flex; justify-content:space-between; font-size:0.65rem; text-transform:uppercase; letter-spacing:0.1em; color:#94a3b8; margin-bottom:1.2rem; font-family:'Space Mono',monospace;"><span>No. 03</span><span>02.14.2026</span></div>
-                <div style="font-size:2rem; color:#0f172a; font-family:'Bebas Neue',sans-serif; margin-bottom:0.6rem;">BLR → HYD</div>
-                <div style="width:40px; height:1px; background:#3b82f6; margin-bottom:1rem;"></div>
-                <div style="font-size:0.72rem; color:#64748b; line-height:1.6; font-family:'Space Mono',monospace;">SR20. 2.1h Total Time. Day VFR<br>Cross-Country PIC.</div>
-            </div>
-            <div style="min-width:250px; background:white; padding:1.8rem; border:1px solid #e2e8f0; position:relative; transition:transform 0.3s;">
-                <div style="display:flex; justify-content:space-between; font-size:0.65rem; text-transform:uppercase; letter-spacing:0.1em; color:#94a3b8; margin-bottom:1.2rem; font-family:'Space Mono',monospace;"><span>No. 04</span><span>02.07.2026</span></div>
-                <div style="font-size:2rem; color:#0f172a; font-family:'Bebas Neue',sans-serif; margin-bottom:0.6rem;">CCU → DEL</div>
-                <div style="width:40px; height:1px; background:#3b82f6; margin-bottom:1rem;"></div>
-                <div style="font-size:0.72rem; color:#64748b; line-height:1.6; font-family:'Space Mono',monospace;">C152. 1.3h Total Time. Night VFR<br>Local PIC.</div>
-            </div>
-        </div>
         """, unsafe_allow_html=True)
+
+        recent_df = df_dash.copy()
+        recent_df['STD_sort'] = pd.to_datetime(
+            recent_df['Date'].astype(str) + " " + recent_df['STD'].astype(str),
+            errors='coerce'
+        )
+        recent_df['STA_sort'] = pd.to_datetime(
+            recent_df['Date'].astype(str) + " " + recent_df['STA'].astype(str),
+            errors='coerce'
+        )
+        recent_df['ATA_sort'] = pd.to_datetime(
+            recent_df['Date'].astype(str) + " " + recent_df['ATA'].astype(str).str.replace('Landed ', '', regex=False),
+            errors='coerce'
+        )
+        recent_df['ATD_sort'] = pd.to_datetime(
+            recent_df['Date'].astype(str) + " " + recent_df['ATD'].astype(str),
+            errors='coerce'
+        )
+        recent_df['Delay (mins)'] = (
+            (recent_df['ATA_sort'] - recent_df['STA_sort']).dt.total_seconds() / 60
+        ).fillna((recent_df['ATD_sort'] - recent_df['STD_sort']).dt.total_seconds() / 60).fillna(0).round(0)
+        recent_df = recent_df.sort_values('STD_sort', ascending=False).head(20)
+        recent_df['StatusColor'] = recent_df['Status'].astype(str)
+        recent_df.loc[(recent_df['Status'].astype(str).str.lower() == 'cancelled') | (recent_df['Delay (mins)'] >= 30), 'StatusColor'] = '🔴 ' + recent_df['Status'].astype(str)
+        recent_df.loc[(recent_df['Delay (mins)'] >= 1) & (recent_df['Delay (mins)'] < 30), 'StatusColor'] = '🟡 ' + recent_df['Status'].astype(str)
+        recent_df.loc[(recent_df['Delay (mins)'] < 1), 'StatusColor'] = '🟢 ' + recent_df['Status'].astype(str)
+
+        st.dataframe(
+            recent_df[['Flight Number', 'From', 'To', 'STD', 'STA', 'StatusColor', 'Delay (mins)']]
+            .rename(columns={'Flight Number': 'Flight No', 'StatusColor': 'Status'}),
+            use_container_width=True,
+            hide_index=True,
+        )
 
         st.markdown("<hr style='border:none; border-top:1px solid #e2e8f0; margin:1rem 0;'>", unsafe_allow_html=True)
 
@@ -2222,8 +2413,22 @@ def main():
             import json
 
             df_comp = df_dash.copy()
-            df_comp['Start_dt'] = pd.to_datetime(df_comp['Date'].astype(str) + " " + df_comp['STD'].astype(str), errors='coerce')
-            df_comp['End_dt'] = pd.to_datetime(df_comp['Date'].astype(str) + " " + df_comp['STA'].astype(str), errors='coerce')
+            parsed_date = pd.to_datetime(df_comp['Date'], errors='coerce')
+            if 'schedule_day' in df_comp.columns and parsed_date.nunique(dropna=True) <= 1:
+                base = parsed_date.dropna().min() if parsed_date.notna().any() else pd.Timestamp.now().normalize()
+                day_offsets = pd.to_numeric(df_comp['schedule_day'], errors='coerce').fillna(1).astype(int) - 1
+                df_comp['TimelineDate'] = base + pd.to_timedelta(day_offsets, unit='D')
+            else:
+                df_comp['TimelineDate'] = parsed_date.fillna(pd.Timestamp.now().normalize())
+
+            df_comp['Start_dt'] = pd.to_datetime(
+                df_comp['TimelineDate'].dt.strftime('%Y-%m-%d') + " " + df_comp['STD'].astype(str),
+                errors='coerce'
+            )
+            df_comp['End_dt'] = pd.to_datetime(
+                df_comp['TimelineDate'].dt.strftime('%Y-%m-%d') + " " + df_comp['STA'].astype(str),
+                errors='coerce'
+            )
             df_comp = df_comp.sort_values(['Aircraft', 'Start_dt'])
             
             df_comp['next_Start'] = df_comp.groupby('Aircraft')['Start_dt'].shift(-1)
@@ -2236,7 +2441,7 @@ def main():
                 if arr_hr < dep_hr:
                    arr_hr += 24.0
                 
-                date_str = row['Date'] if pd.notna(row['Date']) else "Unknown"
+                date_str = row['TimelineDate'] if pd.notna(row['TimelineDate']) else "Unknown"
                 if isinstance(date_str, pd.Timestamp) or hasattr(date_str, 'strftime'):
                     date_str = date_str.strftime('%Y-%m-%d')
                 else:
@@ -2691,31 +2896,21 @@ renderGrid();
         default_file = "Flight_Data.csv"
         uploaded = st.file_uploader("Upload flight data (CSV)", type=["csv"], key="flightops_upload")
 
-        is_demo_mode = False
         if uploaded:
             df_raw = pd.read_csv(uploaded)
+            df_raw = normalize_columns(df_raw)
+            st.session_state["master_df"] = df_raw.copy()
+            st.session_state["optimization_applied"] = False
+            st.session_state.pop("optimized_df", None)
+        elif "master_df" in st.session_state and not st.session_state["master_df"].empty:
+            df_raw = normalize_columns(st.session_state["master_df"].copy())
         elif os.path.exists(default_file):
-            df_raw = pd.read_csv(default_file)
+            df_raw = normalize_columns(pd.read_csv(default_file))
+            st.session_state["master_df"] = df_raw.copy()
+            st.session_state.setdefault("optimization_applied", False)
         else:
-            is_demo_mode = True
-            st.info("Running in demo mode — using synthetic flight data. Upload a CSV above to use real data.")
-            dates = pd.date_range(start='2024-01-01', periods=100)
-            df_raw = pd.DataFrame({
-                'Unnamed: 2': dates.strftime('%d-%b-%y'),
-                'From': np.random.choice(['Delhi (DEL)', 'Mumbai (BOM)', 'Bangalore (BLR)'], 100),
-                'To': np.random.choice(['Bhubaneswar (BBI)', 'Hyderabad (HYD)', 'Kolkata (CCU)'], 100),
-                'Flight time': ['02:15'] * 100,
-                'Aircraft': ['VT-ABC (B737)'] * 100,
-                'STD': ['10:00 AM'] * 100,
-                'ATD': ['10:15 AM'] * 100,
-                'STA': ['12:15 PM'] * 100,
-                'ATA': ['Landed 12:30 PM'] * 100,
-                'Flight Number': ['AI101'] * 100,
-                'S.No': range(1, 101)
-            })
-
-        # Share uploaded/raw dataset with dashboard pages in this session.
-        st.session_state["shared_dashboard_df"] = df_raw.copy()
+            st.info("Upload a flight CSV to populate this view.")
+            st.stop()
 
         df = clean_flight_data_enhanced(df_raw)
         optimizer = EnhancedScheduleOptimizer(df)
