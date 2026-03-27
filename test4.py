@@ -1393,8 +1393,10 @@ def render_pilot_detail_page(pilot_name, df_dash):
         if flight_date.date() == today.date():
             sectors_today += 1
 
-        # Track last duty end
-        duty_end_dt = flight_date.replace(hour=int(arr_h), minute=int((arr_h % 1) * 60))
+        # Track last duty end (arr_h can be >= 24 when STD is late and STA is next day;
+        # datetime.replace(hour=...) only allows 0..23)
+        fd_norm = pd.Timestamp(flight_date).normalize().to_pydatetime()
+        duty_end_dt = fd_norm + timedelta(hours=float(arr_h))
         if last_duty_end_dt is None or duty_end_dt > last_duty_end_dt:
             last_duty_end_dt = duty_end_dt
 
@@ -2397,464 +2399,57 @@ def main():
             hide_index=True,
         )
 
+        # --- Compliance Metric (full-width, under Recent Flights) ---
+        # Uses recent_df delays to provide a lightweight compliance indicator.
+        delay_threshold = 30  # minutes
+        if len(recent_df) > 0 and 'Delay (mins)' in recent_df.columns:
+            non_cancelled = recent_df['Status'].astype(str).str.lower() != 'cancelled'
+            pass_mask = non_cancelled & (recent_df['Delay (mins)'].fillna(0) < delay_threshold)
+            compliance_rate = float(pass_mask.mean()) * 100.0
+        else:
+            compliance_rate = 0.0
+
+        if compliance_rate >= 85.0:
+            compliance_label = "PASS"
+            bar_color = "#22c55e"
+        elif compliance_rate >= 60.0:
+            compliance_label = "REVIEW"
+            bar_color = "#f59e0b"
+        else:
+            compliance_label = "RISK"
+            bar_color = "#ef4444"
+
+        st.markdown(
+            f"""
+            <div style="margin: 0.2rem 0 1rem 0; width: 100%;">
+                <div style="margin-top:0.2rem;">
+                    <span style="color:#3b82f6; font-size:0.7rem; text-transform:uppercase; letter-spacing:0.3em; font-weight:700; font-family:'Space Mono',monospace;">
+                        COMPLIANCE METRIC
+                    </span>
+                </div>
+                <div style="display:flex; align-items: baseline; gap: 1rem; margin-top:0.35rem;">
+                    <div style="font-family:'Bebas Neue',sans-serif; font-size:2.2rem; color:#0f172a; line-height:1;">
+                        {compliance_rate:.1f}%
+                    </div>
+                    <div style="font-family:'Space Mono',monospace; color:#475569; font-size:0.9rem;">
+                        Status: <span style="font-weight:800; color:{bar_color};">{compliance_label}</span>
+                        <span style="color:#64748b;"> (delay &lt; {delay_threshold}m; excluding cancelled)</span>
+                    </div>
+                </div>
+                <div style="height: 10px; background:#e2e8f0; border-radius: 999px; overflow:hidden; margin-top:0.6rem;">
+                    <div style="height:100%; width:{min(max(compliance_rate, 0.0), 100.0):.1f}%; background:{bar_color};"></div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
         st.markdown("<hr style='border:none; border-top:1px solid #e2e8f0; margin:1rem 0;'>", unsafe_allow_html=True)
-
-        # --- Gantt + Compliance Gauge ---
-        st.markdown("""
-        <div>
-            <span style="color:#3b82f6; font-size:0.7rem; text-transform:uppercase; letter-spacing:0.3em; font-weight:700; font-family:'Space Mono',monospace;">02 / SCHEDULING OVERVIEW</span>
-            <h2 style="font-family:'Bebas Neue',sans-serif; font-size:2.5rem; color:#0f172a; margin:0.3rem 0 0 0;">FLIGHT TIMELINE</h2>
-        </div>
-        """, unsafe_allow_html=True)
-
-        gantt_col, gauge_col = st.columns([2.5, 1])
-
-        with gantt_col:
-            import json
-
-            df_comp = df_dash.copy()
-            parsed_date = pd.to_datetime(df_comp['Date'], errors='coerce')
-            if 'schedule_day' in df_comp.columns and parsed_date.nunique(dropna=True) <= 1:
-                base = parsed_date.dropna().min() if parsed_date.notna().any() else pd.Timestamp.now().normalize()
-                day_offsets = pd.to_numeric(df_comp['schedule_day'], errors='coerce').fillna(1).astype(int) - 1
-                df_comp['TimelineDate'] = base + pd.to_timedelta(day_offsets, unit='D')
-            else:
-                df_comp['TimelineDate'] = parsed_date.fillna(pd.Timestamp.now().normalize())
-
-            df_comp['Start_dt'] = pd.to_datetime(
-                df_comp['TimelineDate'].dt.strftime('%Y-%m-%d') + " " + df_comp['STD'].astype(str),
-                errors='coerce'
-            )
-            df_comp['End_dt'] = pd.to_datetime(
-                df_comp['TimelineDate'].dt.strftime('%Y-%m-%d') + " " + df_comp['STA'].astype(str),
-                errors='coerce'
-            )
-            df_comp = df_comp.sort_values(['Aircraft', 'Start_dt'])
-            
-            df_comp['next_Start'] = df_comp.groupby('Aircraft')['Start_dt'].shift(-1)
-            df_comp['prev_End'] = df_comp.groupby('Aircraft')['End_dt'].shift(1)
-            
-            flight_records = []
-            for _, row in df_comp.iterrows():
-                dep_hr = row['Start_dt'].hour + row['Start_dt'].minute / 60.0 if pd.notna(row['Start_dt']) else 0
-                arr_hr = row['End_dt'].hour + row['End_dt'].minute / 60.0 if pd.notna(row['End_dt']) else 0
-                if arr_hr < dep_hr:
-                   arr_hr += 24.0
-                
-                date_str = row['TimelineDate'] if pd.notna(row['TimelineDate']) else "Unknown"
-                if isinstance(date_str, pd.Timestamp) or hasattr(date_str, 'strftime'):
-                    date_str = date_str.strftime('%Y-%m-%d')
-                else:
-                    date_str = str(date_str)
-                
-                status = "normal"
-                issue = ""
-                basic_status = str(row['Status'])
-                
-                is_overlap = False
-                gap_violation = False
-                
-                if pd.notna(row['prev_End']) and row['Start_dt'] < row['prev_End']:
-                    is_overlap = True
-                if pd.notna(row['next_Start']) and row['End_dt'] > row['next_Start']:
-                    is_overlap = True
-                    
-                if pd.notna(row['prev_End']) and 0 <= (row['Start_dt'] - row['prev_End']).total_seconds() < 7200:
-                    gap_violation = True
-                if pd.notna(row['next_Start']) and 0 <= (row['next_Start'] - row['End_dt']).total_seconds() < 7200:
-                    gap_violation = True
-
-                if basic_status == "Conflict" or is_overlap:
-                    status = "conflict"
-                    issue = "Aircraft double-booked (Overlap)" if is_overlap else "Operational Conflict"
-                elif basic_status == "Delayed" or gap_violation:
-                    status = "warning"
-                    issue = "Tight turnaround (< 2h)" if gap_violation else "Delayed"
-                
-                flight_records.append({
-                    "id": str(row['Flight Number']),
-                    "date": date_str,
-                    "aircraft": str(row['Aircraft']),
-                    "route": f"{row['From']}→{row['To']}",
-                    "dep": dep_hr,
-                    "arr": arr_hr,
-                    "cap": str(row['Captain']),
-                    "fo": str(row['First Officer']),
-                    "status": status,
-                    "issue": issue
-                })
-
-            board_html = """
-<!DOCTYPE html>
-<html>
-<head>
-<link href="https://fonts.googleapis.com/css2?family=Space+Mono&family=Bebas+Neue&display=swap" rel="stylesheet">
-<style>
-* { box-sizing: border-box; margin: 0; padding: 0; }
-body { font-family: 'Space Mono', monospace; background: #f8fafc; color: #0f172a; padding: 1rem; }
-h3 { font-family: 'Bebas Neue', sans-serif; }
-
-.controls {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    background: white;
-    padding: 0.75rem 1rem;
-    border: 1px solid #e2e8f0;
-    margin-bottom: 1rem;
-}
-.ctrl-group {
-    display: flex;
-    align-items: center;
-    gap: 1rem;
-}
-button, select {
-    font-family: 'Space Mono', monospace;
-    background: white;
-    border: 1px solid #e2e8f0;
-    padding: 0.25rem 0.5rem;
-    cursor: pointer;
-    font-size: 0.8rem;
-}
-.toggle-btn.active {
-    background: #0f172a;
-    color: white;
-    border-color: #0f172a;
-}
-.legend-item { display: flex; align-items: center; gap: 0.3rem; font-size: 0.75rem; }
-.legend-box { width: 10px; height: 10px; }
-.box-normal { background: #dbeafe; border: 1px solid #3b82f6; }
-.box-warning { background: #fef3c7; border: 1px solid #f59e0b; }
-.box-conflict { background: #fee2e2; border: 1px solid #ef4444; }
-
-.grid-container {
-    background: white;
-    border: 1px solid #e2e8f0;
-    overflow-x: auto;
-    position: relative;
-    padding-bottom: 1rem;
-}
-.grid-header {
-    display: flex;
-    border-bottom: 1px solid #e2e8f0;
-    height: 30px;
-}
-.left-col {
-    width: 110px;
-    min-width: 110px;
-    border-right: 1px solid #e2e8f0;
-    padding: 0.5rem;
-    font-size: 0.8rem;
-    display: flex;
-    flex-direction: column;
-    justify-content: center;
-    background: #f8fafc;
-    z-index: 20;
-    position: sticky;
-    left: 0;
-}
-.ticks-container {
-    flex: 1;
-    position: relative;
-    min-width: 800px;
-}
-.tick {
-    position: absolute;
-    top: 0;
-    bottom: 0;
-    border-left: 1px dashed #e2e8f0;
-    font-size: 0.7rem;
-    color: #94a3b8;
-    padding-left: 2px;
-}
-.aircraft-row {
-    display: flex;
-    height: 52px;
-    border-bottom: 1px solid #e2e8f0;
-}
-.aircraft-row:hover {
-    background: #f1f5f9;
-}
-.track {
-    flex: 1;
-    position: relative;
-    min-width: 800px;
-}
-.flight-block {
-    position: absolute;
-    height: 36px;
-    top: 8px;
-    border-radius: 0;
-    cursor: pointer;
-    padding: 2px 4px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    text-align: left;
-    font-size: 11px;
-    transition: opacity 0.2s;
-}
-.flight-block.op-down {
-    opacity: 0.2 !important;
-}
-.flight-block:hover {
-    opacity: 0.8 !important;
-    z-index: 10;
-}
-.block-normal { background: #dbeafe; border-left: 3px solid #3b82f6; color: #1e40af; }
-.block-warning { background: #fef3c7; border-left: 3px solid #f59e0b; color: #92400e; }
-.block-conflict { background: #fee2e2; border-left: 3px solid #ef4444; color: #991b1b; }
-
-.detail-panel {
-    background: white;
-    border: 1px solid #e2e8f0;
-    margin-top: 1rem;
-    padding: 1rem;
-    display: none;
-    position: relative;
-}
-.detail-panel.visible { display: block; }
-.close-btn { position: absolute; right: 1rem; top: 1rem; cursor: pointer; font-size: 1.2rem; }
-.detail-grid {
-    display: grid;
-    grid-template-columns: repeat(4, 1fr);
-    gap: 1rem;
-}
-.dc-label { font-size: 10px; text-transform: uppercase; color: #94a3b8; margin-bottom: 2px; }
-.dc-value { font-size: 14px; }
-</style>
-</head>
-<body>
-
-<div class="controls">
-    <div class="ctrl-group">
-        <button id="btnPrev">&lt;</button>
-        <span id="dateLabel" style="font-weight: bold; width: 100px; text-align: center;">YYYY-MM-DD</span>
-        <button id="btnNext">&gt;</button>
-    </div>
-    <div class="ctrl-group">
-        <select id="acFilter"><option value="ALL">All Aircraft</option></select>
-    </div>
-    <div class="ctrl-group" id="toggles">
-        <button class="toggle-btn active" data-type="normal">Normal</button>
-        <button class="toggle-btn active" data-type="warning">Warning</button>
-        <button class="toggle-btn active" data-type="conflict">Conflict</button>
-    </div>
-    <div class="ctrl-group">
-        <div class="legend-item"><div class="legend-box box-normal"></div>Normal</div>
-        <div class="legend-item"><div class="legend-box box-warning"></div>Warning</div>
-        <div class="legend-item"><div class="legend-box box-conflict"></div>Conflict</div>
-    </div>
-</div>
-
-<div class="grid-container">
-    <div class="grid-header">
-        <div class="left-col" style="background: transparent; border-right: none;"></div>
-        <div class="ticks-container" id="ticksContainer"></div>
-    </div>
-    <div id="rowsContainer"></div>
-</div>
-
-<div class="detail-panel" id="detailPanel">
-    <div class="close-btn" onclick="document.getElementById('detailPanel').classList.remove('visible')">×</div>
-    <div class="detail-grid" id="detailGrid"></div>
-</div>
-
-<script>
-const FLIGHTS = __FLIGHT_RECORDS_JSON__;
-
-let dates = [...new Set(FLIGHTS.map(f => f.date))].sort();
-let currentDateIdx = 0;
-let aircraftList = [...new Set(FLIGHTS.map(f => f.aircraft))].sort();
-let activeFilters = { normal: true, warning: true, conflict: true };
-let selectedAc = 'ALL';
-
-const dateLabel = document.getElementById('dateLabel');
-const acFilter = document.getElementById('acFilter');
-const ticksContainer = document.getElementById('ticksContainer');
-const rowsContainer = document.getElementById('rowsContainer');
-const detailPanel = document.getElementById('detailPanel');
-const detailGrid = document.getElementById('detailGrid');
-
-for (let i = 0; i <= 24; i += 2) {
-    let tick = document.createElement('div');
-    tick.className = 'tick';
-    tick.style.left = (i / 24 * 100) + '%';
-    tick.innerText = (i < 10 ? '0'+i : i) + ':00';
-    ticksContainer.appendChild(tick);
-}
-
-aircraftList.forEach(ac => {
-    let opt = document.createElement('option');
-    opt.value = ac;
-    opt.innerText = ac;
-    acFilter.appendChild(opt);
-});
-
-acFilter.addEventListener('change', (e) => {
-    selectedAc = e.target.value;
-    renderGrid();
-});
-
-document.getElementById('btnPrev').addEventListener('click', () => {
-    if (currentDateIdx > 0) { currentDateIdx--; renderGrid(); }
-});
-document.getElementById('btnNext').addEventListener('click', () => {
-    if (currentDateIdx < dates.length - 1) { currentDateIdx++; renderGrid(); }
-});
-
-document.querySelectorAll('.toggle-btn').forEach(btn => {
-    btn.addEventListener('click', (e) => {
-        let type = e.target.getAttribute('data-type');
-        activeFilters[type] = !activeFilters[type];
-        e.target.classList.toggle('active', activeFilters[type]);
-        updateBlockVisibility();
-    });
-});
-
-function renderGrid() {
-    if (dates.length === 0) return;
-    let curDate = dates[currentDateIdx];
-    dateLabel.innerText = curDate;
-    
-    rowsContainer.innerHTML = '';
-    
-    let currentFlights = FLIGHTS.filter(f => f.date === curDate);
-    
-    let acsToRender = selectedAc === 'ALL' ? aircraftList : [selectedAc];
-    
-    acsToRender.forEach(ac => {
-        let acFlights = currentFlights.filter(f => f.aircraft === ac);
-        
-        let row = document.createElement('div');
-        row.className = 'aircraft-row';
-        
-        let warns = acFlights.filter(f => f.status === 'warning').length;
-        let confs = acFlights.filter(f => f.status === 'conflict').length;
-        let subLabelText = "Clear";
-        let subColor = "#94a3b8";
-        if (confs > 0) { subLabelText = confs + " Conflict" + (confs>1?'s':''); subColor = "#ef4444"; }
-        else if (warns > 0) { subLabelText = warns + " Warning" + (warns>1?'s':''); subColor = "#f59e0b"; }
-        
-        row.innerHTML = `
-            <div class="left-col">
-                <div style="font-weight:bold;">${ac}</div>
-                <div style="font-size:0.65rem; color:${subColor};">${subLabelText}</div>
-            </div>
-            <div class="track" id="track-${ac}"></div>
-        `;
-        rowsContainer.appendChild(row);
-        
-        let track = row.querySelector('.track');
-        acFlights.forEach(f => {
-            let block = document.createElement('button');
-            block.className = `flight-block block-${f.status}`;
-            block.style.left = ((f.dep / 24) * 100) + '%';
-            
-            let duration = f.arr - f.dep;
-            if (duration < 0) duration += 24; 
-            block.style.width = ((duration / 24) * 100) + '%';
-            
-            block.innerText = f.id + " " + f.route;
-            block.setAttribute('data-type', f.status);
-            
-            block.onclick = () => showDetail(f);
-            track.appendChild(block);
-        });
-    });
-    
-    updateBlockVisibility();
-    detailPanel.classList.remove('visible');
-}
-
-function updateBlockVisibility() {
-    document.querySelectorAll('.flight-block').forEach(block => {
-        let type = block.getAttribute('data-type');
-        if (activeFilters[type]) {
-            block.classList.remove('op-down');
-        } else {
-            block.classList.add('op-down');
-        }
-    });
-}
-
-function formatFloatHour(hourFloat) {
-    let h = Math.floor(hourFloat);
-    let m = Math.round((hourFloat - h) * 60);
-    if (m === 60) { h++; m = 0; }
-    h = h % 24;
-    return (h < 10 ? '0'+h : h) + ':' + (m < 10 ? '0'+m : m);
-}
-
-function showDetail(f) {
-    detailPanel.classList.add('visible');
-    let dur = f.arr - f.dep;
-    if (dur < 0) dur += 24;
-    
-    let durStr = Math.floor(dur) + 'h ' + Math.round((dur - Math.floor(dur)) * 60) + 'm';
-    
-    let issueStr = f.issue ? f.issue : "None";
-    let issueColor = f.status === 'conflict' ? '#ef4444' : (f.status === 'warning' ? '#f59e0b' : '#0f172a');
-    
-    detailGrid.innerHTML = `
-        <div><div class="dc-label">Route</div><div class="dc-value">${f.route}</div></div>
-        <div><div class="dc-label">Departure</div><div class="dc-value">${formatFloatHour(f.dep)}</div></div>
-        <div><div class="dc-label">Arrival</div><div class="dc-value">${formatFloatHour(f.arr)}</div></div>
-        <div><div class="dc-label">Block Time</div><div class="dc-value">${durStr}</div></div>
-        <div><div class="dc-label">Captain</div><div class="dc-value">${f.cap}</div></div>
-        <div><div class="dc-label">First Officer</div><div class="dc-value">${f.fo}</div></div>
-        <div><div class="dc-label">Aircraft</div><div class="dc-value">${f.aircraft}</div></div>
-        <div><div class="dc-label">Conflict Reason</div><div class="dc-value" style="color:${issueColor};">${issueStr}</div></div>
-    `;
-}
-
-renderGrid();
-</script>
-</body>
-</html>
-"""
-            board_html = board_html.replace('__FLIGHT_RECORDS_JSON__', json.dumps(flight_records))
-            import streamlit.components.v1 as components
-            components.html(board_html, height=520, scrolling=False)
-
-        with gauge_col:
-            st.markdown("##### 🛡️ Compliance Pulse")
-            import plotly.graph_objects as go
-            compliance_pct = 94
-            gauge_fig = go.Figure(go.Indicator(
-                mode="gauge+number",
-                value=compliance_pct,
-                title={'text': "Policy Coverage", 'font': {'size': 14, 'family': 'Space Mono'}},
-                number={'suffix': '%', 'font': {'size': 36, 'color': '#0f172a', 'family': 'Bebas Neue'}},
-                gauge={
-                    'axis': {'range': [0, 100], 'tickwidth': 0, 'tickcolor': "white"},
-                    'bar': {'color': '#10b981'},
-                    'bgcolor': '#e2e8f0',
-                    'borderwidth': 0,
-                    'steps': [
-                        {'range': [0, 60], 'color': '#fee2e2'},
-                        {'range': [60, 85], 'color': '#fef3c7'},
-                        {'range': [85, 100], 'color': '#d1fae5'}
-                    ],
-                }
-            ))
-            gauge_fig.update_layout(height=200, margin=dict(l=20, r=20, t=40, b=0), paper_bgcolor="rgba(0,0,0,0)")
-            st.plotly_chart(gauge_fig, use_container_width=True)
-
-            st.markdown("""
-            <div style="background:white; border:1px solid #e2e8f0; padding:0.8rem; font-size:0.72rem; font-family:'Space Mono',monospace;">
-                <div style="display:flex; justify-content:space-between; margin-bottom:0.5rem;"><span>DGCA Duty Limits</span><span style="background:#d1fae5; color:#059669; padding:0.15rem 0.5rem; font-size:0.65rem; font-weight:600;">Active</span></div>
-                <div style="display:flex; justify-content:space-between; margin-bottom:0.5rem;"><span>Fatigue Risk Model</span><span style="background:#d1fae5; color:#059669; padding:0.15rem 0.5rem; font-size:0.65rem; font-weight:600;">Active</span></div>
-                <div style="display:flex; justify-content:space-between;"><span>Crew Rest Rules</span><span style="background:#fef3c7; color:#d97706; padding:0.15rem 0.5rem; font-size:0.65rem; font-weight:600;">Review</span></div>
-            </div>
-            """, unsafe_allow_html=True)
-
-        st.markdown("<hr style='border:none; border-top:1px solid #e2e8f0; margin:1.5rem 0;'>", unsafe_allow_html=True)
 
         # --- Alerts + Activity ---
         st.markdown("""
         <div>
-            <span style="color:#3b82f6; font-size:0.7rem; text-transform:uppercase; letter-spacing:0.3em; font-weight:700; font-family:'Space Mono',monospace;">03 / SYSTEM STATUS</span>
+            <span style="color:#3b82f6; font-size:0.7rem; text-transform:uppercase; letter-spacing:0.3em; font-weight:700; font-family:'Space Mono',monospace;">02 / SYSTEM STATUS</span>
             <h2 style="font-family:'Bebas Neue',sans-serif; font-size:2.5rem; color:#0f172a; margin:0.3rem 0 0.5rem 0;">ALERTS & ACTIVITY</h2>
         </div>
         """, unsafe_allow_html=True)
