@@ -115,6 +115,101 @@ def get_active_df_for_views() -> pd.DataFrame:
     return pd.DataFrame()
 
 
+def crew_rules_for_schedule_board() -> dict:
+    """
+    Map Crew Manager sliders (fh_hours, fh_ratio, fh_wl) to Schedule Board JS rule constants.
+    Defaults match the Crew Manager slider defaults when those keys are missing.
+    """
+    h = float(st.session_state.get("fh_hours", 7.5))
+    r = float(st.session_state.get("fh_ratio", 1.5))
+    w = int(st.session_state.get("fh_wl", 60))
+
+    max_block_h = round(min(12.0, max(6.0, h)), 2)
+    max_duties = int(max(3, min(7, round(6 - max(0.0, r - 1.5) * 1.2))))
+    min_rest_h = round(float(max(6.0, min(12.0, 8.0 + (r - 1.5) * 1.5))), 2)
+    fatigue_thresh = int(max(2, min(5, round(4 - (w - 35) / 22))))
+    duty_hours = round(min(3.5, max(1.2, max_block_h / max(max_duties, 1))), 2)
+
+    return {
+        "duty_hours": duty_hours,
+        "max_duties": max_duties,
+        "max_block_h": max_block_h,
+        "min_rest_h": min_rest_h,
+        "fatigue_thresh": fatigue_thresh,
+    }
+
+
+def _schedule_board_row_uid(row: pd.Series) -> str:
+    fn = str(row.get("Flight Number", "N/A"))
+    dts = pd.to_datetime(row.get("Date"), errors="coerce")
+    date_part = dts.strftime("%Y-%m-%d") if pd.notna(dts) else ""
+    return f"{fn}|{date_part}" if date_part else fn
+
+
+def _pilot_schedule_board_has_conflict(
+    flight_ids: list, flight_meta: dict, crew_rules: dict
+) -> bool:
+    """Match Schedule Board JS detectConflicts — conflict type only (not fatigue warning)."""
+    if not flight_ids:
+        return False
+    ids = list(dict.fromkeys(flight_ids))
+    n = len(ids)
+    dh = float(crew_rules["duty_hours"])
+    if n > int(crew_rules["max_duties"]):
+        return True
+    if n * dh > float(crew_rules["max_block_h"]):
+        return True
+    seen_ac = set()
+    for fid in ids:
+        ac = str(flight_meta.get(fid, {}).get("aircraft", "N/A")).strip()
+        if ac and ac.upper() != "N/A":
+            if ac in seen_ac:
+                return True
+            seen_ac.add(ac)
+    return False
+
+
+def filter_schedule_board_passing_flights(df: pd.DataFrame, crew_rules: dict) -> pd.DataFrame:
+    """
+    Keep rows where both Captain and First Officer have no rule conflicts
+    when their full schedule in df is evaluated (same logic as the embedded board).
+    """
+    if df.empty:
+        return df
+
+    from collections import defaultdict
+
+    pilot_flights: dict = defaultdict(list)
+    flight_meta: dict = {}
+
+    for _, row in df.iterrows():
+        uid = _schedule_board_row_uid(row)
+        flight_meta[uid] = {"aircraft": str(row.get("Aircraft", "N/A"))}
+        cap = str(row.get("Captain", "")).strip()
+        fo = str(row.get("First Officer", "")).strip()
+        if cap and cap.upper() != "N/A":
+            pilot_flights[cap].append(uid)
+        if fo and fo.upper() != "N/A":
+            pilot_flights[fo].append(uid)
+
+    pilot_conflict = {
+        p: _pilot_schedule_board_has_conflict(fids, flight_meta, crew_rules)
+        for p, fids in pilot_flights.items()
+    }
+
+    def row_passes(row: pd.Series) -> bool:
+        cap = str(row.get("Captain", "")).strip()
+        fo = str(row.get("First Officer", "")).strip()
+        if cap and cap.upper() != "N/A" and pilot_conflict.get(cap, False):
+            return False
+        if fo and fo.upper() != "N/A" and pilot_conflict.get(fo, False):
+            return False
+        return True
+
+    mask = df.apply(row_passes, axis=1)
+    return df.loc[mask].copy()
+
+
 def propose_optimized_schedule(master_df: pd.DataFrame, max_shift_minutes: int = 30) -> pd.DataFrame:
     """
     Create a proposed optimized schedule from master_df.
@@ -1770,6 +1865,23 @@ def render_scheduling_board():
         st.info("Upload a flight CSV to populate this view.")
         return
 
+    PAGE_SIZE = 20
+    if "schedule_board_offset" not in st.session_state:
+        st.session_state["schedule_board_offset"] = 0
+
+    crew_rules = crew_rules_for_schedule_board()
+    df_board = df_dash.copy()
+    sort_date = pd.to_datetime(df_board.get("Date"), errors="coerce")
+    df_board["_sb_sort_date"] = sort_date
+    if "Flight Number" in df_board.columns:
+        df_board["_sb_sort_fn"] = df_board["Flight Number"].astype(str)
+    else:
+        df_board["_sb_sort_fn"] = df_board.index.astype(str)
+    df_board = df_board.sort_values(["_sb_sort_date", "_sb_sort_fn"], na_position="last").drop(
+        columns=["_sb_sort_date", "_sb_sort_fn"]
+    )
+    n_all_flights = len(df_board)
+
     # Optimization controls (proposal vs confirm/discard)
     c1, c2, c3 = st.columns([1.5, 1.2, 1.2])
     with c1:
@@ -1817,12 +1929,84 @@ def render_scheduling_board():
             )
         st.markdown("---")
 
-    # Build flight data for the JS board
+    only_compliant = st.checkbox(
+        "Only show flights that pass crew rules",
+        value=True,
+        key="sched_board_compliant_only",
+        help="Uses the same limits as the board (max duties, block hours, no double-booked aircraft per pilot). "
+        "Tightening Crew Manager sliders can remove more flights from this list.",
+    )
+    prev_filt = st.session_state.get("_sched_board_compliant_prev")
+    if prev_filt is not None and prev_filt != only_compliant:
+        st.session_state["schedule_board_offset"] = 0
+    st.session_state["_sched_board_compliant_prev"] = only_compliant
+
+    df_view = df_board
+    if only_compliant:
+        df_view = filter_schedule_board_passing_flights(df_board, crew_rules)
+
+    n_total = len(df_view)
+    max_offset = max(0, (max(n_total - 1, 0) // PAGE_SIZE) * PAGE_SIZE)
+    if st.session_state["schedule_board_offset"] > max_offset:
+        st.session_state["schedule_board_offset"] = max_offset
+
+    off = int(st.session_state["schedule_board_offset"])
+    page_df = df_view.iloc[off : off + PAGE_SIZE]
+    start_i = off + 1 if n_total else 0
+    end_i = min(off + PAGE_SIZE, n_total)
+
+    if only_compliant and n_all_flights > 0 and n_total == 0:
+        st.warning(
+            "No flights pass the current crew rules. Relax the **Crew Manager** sliders or turn off "
+            "**Only show flights that pass crew rules** to see the full schedule."
+        )
+
+    st.caption(
+        "Board rules follow **Crew Manager** sliders: "
+        f"~{crew_rules['duty_hours']}h/duty est., max **{crew_rules['max_duties']}** duties, "
+        f"**{crew_rules['max_block_h']}h** block cap, **{crew_rules['min_rest_h']}h** rest threshold, "
+        f"fatigue warn after **{crew_rules['fatigue_thresh']}** duties."
+    )
+    if only_compliant and n_all_flights:
+        hidden = n_all_flights - n_total
+        st.caption(
+            f"**{n_total}** flights pass ({hidden} hidden). Uncheck the box to show all **{n_all_flights}** flights."
+        )
+
+    nav_a, nav_b, nav_c = st.columns([1, 2, 1])
+    with nav_a:
+        if st.button("← Previous 20", key="sched_board_prev", disabled=(off <= 0), use_container_width=True):
+            st.session_state["schedule_board_offset"] = max(0, off - PAGE_SIZE)
+            st.rerun()
+    with nav_b:
+        st.markdown(
+            f"<div style='text-align:center;font-family:Space Mono,monospace;font-size:0.85rem;color:#475569;padding:0.35rem 0;'>"
+            f"Showing flights <b>{start_i}–{end_i}</b> of <b>{n_total}</b></div>",
+            unsafe_allow_html=True,
+        )
+    with nav_c:
+        if st.button(
+            "Next 20 →",
+            key="sched_board_next",
+            disabled=(off >= max_offset and n_total > 0) or n_total == 0,
+            use_container_width=True,
+        ):
+            st.session_state["schedule_board_offset"] = min(max_offset, off + PAGE_SIZE)
+            st.rerun()
+
+    # Build flight data for the JS board (current page only; id unique per date)
     flights_data = []
-    for _, row in df_dash.head(20).iterrows():
+    for _, row in page_df.iterrows():
+        fn = str(row.get("Flight Number", "N/A"))
+        dts = pd.to_datetime(row.get("Date"), errors="coerce")
+        date_part = dts.strftime("%Y-%m-%d") if pd.notna(dts) else ""
+        uid = f"{fn}|{date_part}" if date_part else fn
+        date_label = dts.strftime("%d %b %Y") if pd.notna(dts) else "—"
         flights_data.append({
-            'id': str(row.get('Flight Number', 'N/A')),
-            'aircraft': str(row.get('Aircraft', 'N/A')),
+            "id": uid,
+            "label": fn,
+            "date_label": date_label,
+            "aircraft": str(row.get('Aircraft', 'N/A')),
             'from': str(row.get('From', 'N/A')),
             'to': str(row.get('To', 'N/A')),
             'std': str(row.get('STD', 'N/A')),
@@ -1843,9 +2027,9 @@ def render_scheduling_board():
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Bebas+Neue&display=swap" rel="stylesheet">
 <style>
 * { margin:0; padding:0; box-sizing:border-box; }
-body { font-family:'Space Mono',monospace; background:#f8fafc; color:#0f172a; }
-.app-layout { display:grid; grid-template-columns:70fr 30fr; gap:1.2rem; padding:1rem; min-height:760px; }
-.main-col { min-width:0; }
+body { font-family:'Space Mono',monospace; background:#f8fafc; color:#0f172a; overflow-x:hidden; }
+.app-layout { display:grid; grid-template-columns:70fr 30fr; gap:1.2rem; padding:1rem; min-height:760px; overflow:visible; }
+.main-col { min-width:0; overflow:visible; }
 .toolbar { display:flex; gap:0.5rem; margin-bottom:1rem; align-items:center; flex-wrap:wrap; background:white; border:1px solid #e2e8f0; padding:0.6rem 0.8rem; }
 .toolbar button { color:#0f172a; padding:0.4rem 0.85rem; border:1px solid #e2e8f0; background:white; border-radius:0; cursor:pointer; font-size:0.75rem; font-family:'Space Mono',monospace; font-weight:700; letter-spacing:0.02em; transition:background-color 0.15s ease, color 0.15s ease, border-color 0.15s ease; }
 .toolbar button:not(:disabled):hover { border-color:#3b82f6; color:#1d4ed8; background-color:#eff6ff; }
@@ -1856,7 +2040,7 @@ body { font-family:'Space Mono',monospace; background:#f8fafc; color:#0f172a; }
 .legend { display:flex; gap:1.2rem; margin-bottom:0.8rem; font-size:0.7rem; letter-spacing:0.02em; color:#64748b; }
 .legend span { display:flex; align-items:center; gap:0.35rem; }
 .legend .dot { width:12px; height:12px; }
-.board { display:grid; grid-template-columns:140px 1fr; border:1px solid #e2e8f0; overflow:hidden; background:white; }
+.board { display:grid; grid-template-columns:140px 1fr; border:1px solid #e2e8f0; overflow:visible; background:white; }
 .pilot-label { padding:0.65rem 0.7rem; background:#f1f5f9; border-bottom:1px solid #e2e8f0; font-weight:700; font-size:0.8rem; display:flex; align-items:center; gap:0.3rem; min-height:88px; font-family:'Space Mono',monospace; letter-spacing:-0.01em; word-break:break-word; color:#0f172a; }
 .pilot-label.affected { background:#fef3c7; border-left:3px solid #f59e0b; }
 .pilot-label.conflict-row { background:#fee2e2; border-left:3px solid #ef4444; }
@@ -1868,12 +2052,28 @@ body { font-family:'Space Mono',monospace; background:#f8fafc; color:#0f172a; }
 @keyframes pulseAmber { 0%,100% { box-shadow:inset 0 0 0 2px rgba(245,158,11,0.5); } 50% { box-shadow:inset 0 0 0 2px rgba(245,158,11,0); } }
 .pilot-row.row-warning .row-bg { animation: pulseAmber 2s infinite; }
 .pilot-row.row-conflict .row-bg { box-shadow:inset 0 0 0 2px #ef4444; }
-.flight-card { position:relative; z-index:2; width:172px; height:72px; padding:0.45rem 0.65rem; border-radius:0; font-size:0.76rem; cursor:grab; user-select:none; border:2px solid transparent; transition:background-color 0.15s ease, outline 0.15s ease, transform 0.15s ease; outline:2px solid transparent; display:flex; flex-direction:column; justify-content:center; overflow:hidden; font-family:'Space Mono',monospace; }
-.flight-card:hover { outline:2px solid #bfdbfe; outline-offset:2px; z-index:10; }
-.flight-card.dragging { opacity:0.5; outline:2px dashed #3b82f6; }
+.flight-card { position:relative; z-index:2; width:172px; min-height:72px; padding:0.45rem 0.65rem; border-radius:0; font-size:0.76rem; cursor:grab; user-select:none; border:2px solid transparent; transition:background-color 0.15s ease, outline 0.15s ease, transform 0.15s ease; outline:2px solid transparent; display:flex; flex-direction:column; justify-content:center; overflow:visible; font-family:'Space Mono',monospace; }
+.flight-card:hover { outline:2px solid #bfdbfe; outline-offset:2px; z-index:80; }
+.flight-card.dragging { opacity:0.5; outline:2px dashed #3b82f6; z-index:60; }
 .flight-card:active { cursor:grabbing; transform:scale(1.06); box-shadow:0 6px 20px rgb(0 0 0/0.18); }
+.fc-body { width:100%; overflow:hidden; display:flex; flex-direction:column; justify-content:center; flex:1; min-height:0; }
 .flight-card .fid { font-weight:700; font-size:0.86rem; line-height:1.2; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .flight-card .froute { font-size:0.7rem; line-height:1.3; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; opacity:0.85; }
+.fc-tooltip { visibility:hidden; opacity:0; position:absolute; left:50%; top:calc(100% + 6px); transform:translateX(-50%) translateY(0); width:min(288px,calc(100vw - 48px)); max-width:288px; padding:14px 14px 12px; background:#ffffff; border:1px solid #e2e8f0; box-shadow:0 12px 32px rgba(15,23,42,0.12),0 4px 8px rgba(15,23,42,0.06); color:#0f172a; font-size:0.72rem; line-height:1.35; pointer-events:none; transition:opacity 0.18s ease,visibility 0.18s ease,transform 0.18s ease; text-align:left; border-radius:2px; }
+.flight-card:hover .fc-tooltip { visibility:visible; opacity:1; transform:translateX(-50%) translateY(2px); }
+.flight-card.dragging .fc-tooltip { visibility:hidden !important; opacity:0 !important; }
+.fc-tooltip-h { font-family:'Bebas Neue',sans-serif; font-size:1.35rem; letter-spacing:0.06em; color:#0f172a; margin-bottom:2px; line-height:1.1; }
+.fc-tooltip-sub { font-size:0.65rem; color:#64748b; text-transform:uppercase; letter-spacing:0.14em; margin-bottom:4px; font-weight:700; }
+.fc-tooltip-rows { border-top:1px solid #e2e8f0; margin-top:8px; padding-top:8px; display:flex; flex-direction:column; gap:6px; }
+.fc-tooltip-row { display:grid; grid-template-columns:92px 1fr; gap:8px; align-items:start; }
+.fc-tooltip-k { color:#94a3b8; text-transform:uppercase; font-size:0.58rem; letter-spacing:0.1em; font-weight:700; }
+.fc-tooltip-v { color:#334155; font-weight:500; word-break:break-word; }
+.fc-tooltip-assign .fc-tooltip-v { color:#1d4ed8; font-weight:700; }
+.fc-status-pill { display:inline-block; padding:2px 8px; border-radius:999px; font-size:0.62rem; font-weight:800; letter-spacing:0.04em; text-transform:uppercase; }
+.fc-pill-green { background:#dcfce7; color:#166534; }
+.fc-pill-amber { background:#fef3c7; color:#b45309; }
+.fc-pill-red { background:#fee2e2; color:#b91c1c; }
+.fc-pill-blue { background:#dbeafe; color:#1d4ed8; }
 .card-green  { background:#10b981; border-color:#059669; color:#14532d; }
 .card-amber  { background:#f59e0b; border-color:#d97706; color:#78350f; }
 .card-red    { background:#fff1f2; border-color:#dc2626; color:#7f1d1d; box-shadow: inset 0 0 0 2px rgba(220,38,38,0.25); }
@@ -1937,7 +2137,7 @@ body { font-family:'Space Mono',monospace; background:#f8fafc; color:#0f172a; }
 <script>
 const flights = __FLIGHTS_JSON__;
 const pilots  = __PILOTS_JSON__;
-const DUTY_HOURS = 2.25, MAX_DUTIES = 4, MAX_BLOCK_H = 12, MIN_REST_H = 8, FATIGUE_THRESH = 3;
+const DUTY_HOURS = __DUTY_HOURS__, MAX_DUTIES = __MAX_DUTIES__, MAX_BLOCK_H = __MAX_BLOCK_H__, MIN_REST_H = __MIN_REST_H__, FATIGUE_THRESH = __FATIGUE_THRESH__;
 
 let assignments = {};
 let undoStack = [], redoStack = [];
@@ -1951,6 +2151,63 @@ flights.forEach(f => {
 Object.keys(assignments).forEach(k => { originalAssignments[k] = [...assignments[k]]; });
 
 function getFlightById(id) { return flights.find(f => f.id === id); }
+
+function escapeHtml(s) {
+  if (s == null || s === undefined) return '';
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+function airportCode(s) {
+  if (!s) return '\u2014';
+  let m = String(s).match(/\\(([^)]+)\\)/);
+  return m ? m[1] : String(s).trim().slice(0, 8);
+}
+function airportCity(s) {
+  if (!s) return '';
+  let t = String(s).replace(/\\s*\\([^)]+\\)\\s*$/, '').trim();
+  return t || String(s);
+}
+function statusPillClass(st) {
+  let x = String(st || '').toLowerCase();
+  if (x.indexOf('delay') >= 0) return 'fc-pill-amber';
+  if (x.indexOf('cancel') >= 0) return 'fc-pill-red';
+  if (x.indexOf('board') >= 0) return 'fc-pill-blue';
+  return 'fc-pill-green';
+}
+function buildFlightTooltipHtml(fl, rowPilot) {
+  let depC = airportCode(fl.from);
+  let arrC = airportCode(fl.to);
+  let depCity = escapeHtml(airportCity(fl.from));
+  let arrCity = escapeHtml(airportCity(fl.to));
+  let cap = escapeHtml(fl.captain || '\u2014');
+  let fo = escapeHtml(fl.fo || '\u2014');
+  let ac = escapeHtml(fl.aircraft || '\u2014');
+  let st = escapeHtml(fl.status || 'On Time');
+  let pill = statusPillClass(fl.status);
+  let dl = escapeHtml(fl.date_label || '\u2014');
+  let fn = escapeHtml(fl.label || fl.id);
+  let rp = escapeHtml(rowPilot || '');
+  return (
+    '<div class="fc-tooltip">' +
+      '<div class="fc-tooltip-h">' + fn + '</div>' +
+      '<div class="fc-tooltip-sub">' + depC + ' \u2192 ' + arrC + '</div>' +
+      '<div class="fc-tooltip-rows">' +
+        '<div class="fc-tooltip-row"><span class="fc-tooltip-k">Date</span><span class="fc-tooltip-v">' + dl + '</span></div>' +
+        '<div class="fc-tooltip-row"><span class="fc-tooltip-k">Route</span><span class="fc-tooltip-v">' + depCity + ' \u2192 ' + arrCity + '</span></div>' +
+        '<div class="fc-tooltip-row"><span class="fc-tooltip-k">Depart</span><span class="fc-tooltip-v">' + escapeHtml(fl.std) + '</span></div>' +
+        '<div class="fc-tooltip-row"><span class="fc-tooltip-k">Arrive</span><span class="fc-tooltip-v">' + escapeHtml(fl.sta) + '</span></div>' +
+        '<div class="fc-tooltip-row"><span class="fc-tooltip-k">Aircraft</span><span class="fc-tooltip-v">' + ac + '</span></div>' +
+        '<div class="fc-tooltip-row"><span class="fc-tooltip-k">Captain</span><span class="fc-tooltip-v">' + cap + '</span></div>' +
+        '<div class="fc-tooltip-row"><span class="fc-tooltip-k">First officer</span><span class="fc-tooltip-v">' + fo + '</span></div>' +
+        '<div class="fc-tooltip-row"><span class="fc-tooltip-k">Status</span><span class="fc-tooltip-v"><span class="fc-status-pill ' + pill + '">' + st + '</span></span></div>' +
+        '<div class="fc-tooltip-row fc-tooltip-assign"><span class="fc-tooltip-k">On this row</span><span class="fc-tooltip-v">' + rp + '</span></div>' +
+      '</div>' +
+    '</div>'
+  );
+}
 
 function detectConflicts(pName, fids) {
   let issues = [], dutyCount = fids.length, totalBlock = dutyCount * DUTY_HOURS;
@@ -2020,8 +2277,9 @@ function renderBoard() {
       card.draggable = true;
       let routeFrom = fl.from.split('(')[0].trim();
       let routeTo = fl.to.split('(')[0].trim();
-      card.innerHTML = '<div class="fid">' + fl.id + ' &#183; ' + fl.std + '</div><div class="froute">' + routeFrom + ' &#8594; ' + routeTo + '</div>';
-      card.title = fl.id + ' | ' + fl.from + ' > ' + fl.to + ' | ' + fl.std + '-' + fl.sta + ' | ' + fl.aircraft;
+      let dispId = fl.label || fl.id;
+      card.innerHTML = '<div class="fc-body"><div class="fid">' + dispId + ' &#183; ' + fl.std + '</div><div class="froute">' + routeFrom + ' &#8594; ' + routeTo + '</div></div>' + buildFlightTooltipHtml(fl, pilot);
+      card.setAttribute('aria-label', 'Flight ' + dispId + ', drag to reassign');
       card.addEventListener('dragstart', e => { card.classList.add('dragging'); e.dataTransfer.setData('text/plain', JSON.stringify({ fid: fid, fromPilot: pilot })); });
       card.addEventListener('dragend', () => { card.classList.remove('dragging'); });
       row.appendChild(card);
@@ -2135,7 +2393,15 @@ renderBoard();
 </html>
 """
 
-    board_html = board_template.replace('__FLIGHTS_JSON__', flights_json).replace('__PILOTS_JSON__', pilots_json)
+    board_html = (
+        board_template.replace('__FLIGHTS_JSON__', flights_json)
+        .replace('__PILOTS_JSON__', pilots_json)
+        .replace('__DUTY_HOURS__', str(crew_rules['duty_hours']))
+        .replace('__MAX_DUTIES__', str(crew_rules['max_duties']))
+        .replace('__MAX_BLOCK_H__', str(crew_rules['max_block_h']))
+        .replace('__MIN_REST_H__', str(crew_rules['min_rest_h']))
+        .replace('__FATIGUE_THRESH__', str(crew_rules['fatigue_thresh']))
+    )
 
     st.markdown("# \u2708\ufe0f Interactive Scheduling Board")
     st.markdown("Drag flight cards between pilots to reassign duties. The **Impact Dashboard** updates in real-time.")
