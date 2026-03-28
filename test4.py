@@ -19,19 +19,15 @@ import re
 import pandas as pd
 import streamlit as st
 import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import networkx as nx
 from datetime import datetime, timedelta
 from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 from sklearn.metrics import accuracy_score, classification_report
-from sentence_transformers import SentenceTransformer, util
 
 # Try to import XGBoost
 try:
@@ -139,81 +135,82 @@ def crew_rules_for_schedule_board() -> dict:
     }
 
 
-def _schedule_board_row_uid(row: pd.Series) -> str:
-    fn = str(row.get("Flight Number", "N/A"))
-    dts = pd.to_datetime(row.get("Date"), errors="coerce")
-    date_part = dts.strftime("%Y-%m-%d") if pd.notna(dts) else ""
-    return f"{fn}|{date_part}" if date_part else fn
+def _fatigue_triple_from_totals(total_h: float, sectors: int, delays: int) -> tuple:
+    """RF feature triple from aggregated duty stats (same mapping as pilot-day features)."""
+    if sectors <= 0:
+        return 4.0, 1.0, 35.0
+    total_h = float(total_h)
+    hours_feat = float(np.clip(total_h, 1.0, 14.0))
+    rest_proxy = max(2.0, 14.0 - total_h)
+    ratio_feat = float(
+        np.clip((total_h / rest_proxy) * (1.0 + 0.14 * max(0, sectors - 3)), 0.5, 3.5)
+    )
+    workload_feat = float(
+        np.clip(
+            18.0 + sectors * 9.0 + float(delays) * 14.0 + max(0.0, total_h - 8.0) * 5.0,
+            10.0,
+            100.0,
+        )
+    )
+    return hours_feat, ratio_feat, workload_feat
 
 
-def _pilot_schedule_board_has_conflict(
-    flight_ids: list, flight_meta: dict, crew_rules: dict
-) -> bool:
-    """Match Schedule Board JS detectConflicts — conflict type only (not fatigue warning)."""
-    if not flight_ids:
-        return False
-    ids = list(dict.fromkeys(flight_ids))
-    n = len(ids)
-    dh = float(crew_rules["duty_hours"])
-    if n > int(crew_rules["max_duties"]):
-        return True
-    if n * dh > float(crew_rules["max_block_h"]):
-        return True
-    seen_ac = set()
-    for fid in ids:
-        ac = str(flight_meta.get(fid, {}).get("aircraft", "N/A")).strip()
-        if ac and ac.upper() != "N/A":
-            if ac in seen_ac:
-                return True
-            seen_ac.add(ac)
-    return False
-
-
-def filter_schedule_board_passing_flights(df: pd.DataFrame, crew_rules: dict) -> pd.DataFrame:
+def fatigue_features_for_pilot_day(df: pd.DataFrame, pilot: str, dkey: str) -> tuple:
     """
-    Keep rows where both Captain and First Officer have no rule conflicts
-    when their full schedule in df is evaluated (same logic as the embedded board).
+    Map one pilot's duties on a calendar day to RandomForest inputs
+    (avg_flight_hours, duty_to_rest_ratio, workload_index).
     """
-    if df.empty:
-        return df
+    pilot = str(pilot).strip()
+    if not pilot or pilot.upper() == "N/A":
+        return 4.0, 1.0, 35.0
+    dk = str(dkey)
+    m = (
+        ((df["Captain"] == pilot) | (df["First Officer"] == pilot))
+        & (df["DateKey"].astype(str) == dk)
+    )
+    sub = df.loc[m]
+    if sub.empty:
+        return 4.0, 1.0, 35.0
+    total_h = float(sub["DurationHrs"].sum())
+    sectors = len(sub)
+    delays = int((sub["Status"].astype(str).str.lower() == "delayed").sum())
+    return _fatigue_triple_from_totals(total_h, sectors, delays)
 
-    from collections import defaultdict
 
-    pilot_flights: dict = defaultdict(list)
-    flight_meta: dict = {}
+def _summarize_pilot_days(df: pd.DataFrame) -> pd.DataFrame:
+    """One groupby over the schedule; avoids O(pilots × rows) dataframe filters."""
+    c = df["Captain"].astype(str).str.strip()
+    f = df["First Officer"].astype(str).str.strip()
+    dk = df["DateKey"].astype(str)
+    dur = df["DurationHrs"].astype(float)
+    dly = (df["Status"].astype(str).str.lower() == "delayed").astype(int)
+    p1 = pd.DataFrame({"pilot": c.values, "dkey": dk.values, "dur": dur.values, "dly": dly.values})
+    p2 = pd.DataFrame({"pilot": f.values, "dkey": dk.values, "dur": dur.values, "dly": dly.values})
+    pl = pd.concat([p1, p2], ignore_index=True)
+    pl = pl[(pl["pilot"] != "") & (pl["pilot"].str.upper() != "N/A")]
+    if pl.empty:
+        return pd.DataFrame(columns=["total_h", "sectors", "delays"]).astype({"sectors": int, "delays": int})
+    return pl.groupby(["pilot", "dkey"], sort=False).agg(
+        total_h=("dur", "sum"),
+        sectors=("dur", "count"),
+        delays=("dly", "sum"),
+    )
 
-    for _, row in df.iterrows():
-        uid = _schedule_board_row_uid(row)
-        flight_meta[uid] = {"aircraft": str(row.get("Aircraft", "N/A"))}
-        cap = str(row.get("Captain", "")).strip()
-        fo = str(row.get("First Officer", "")).strip()
-        if cap and cap.upper() != "N/A":
-            pilot_flights[cap].append(uid)
-        if fo and fo.upper() != "N/A":
-            pilot_flights[fo].append(uid)
 
-    pilot_conflict = {
-        p: _pilot_schedule_board_has_conflict(fids, flight_meta, crew_rules)
-        for p, fids in pilot_flights.items()
-    }
-
-    def row_passes(row: pd.Series) -> bool:
-        cap = str(row.get("Captain", "")).strip()
-        fo = str(row.get("First Officer", "")).strip()
-        if cap and cap.upper() != "N/A" and pilot_conflict.get(cap, False):
-            return False
-        if fo and fo.upper() != "N/A" and pilot_conflict.get(fo, False):
-            return False
-        return True
-
-    mask = df.apply(row_passes, axis=1)
-    return df.loc[mask].copy()
+def _summ_get(summ: pd.DataFrame, pilot: str, dkey: str):
+    key = (str(pilot).strip(), str(dkey))
+    if summ.empty or key not in summ.index:
+        return 0.0, 0, 0
+    row = summ.loc[key]
+    return float(row["total_h"]), int(row["sectors"]), int(row["delays"])
 
 
 def propose_optimized_schedule(master_df: pd.DataFrame, max_shift_minutes: int = 30) -> pd.DataFrame:
     """
-    Create a proposed optimized schedule from master_df.
-    Uses existing optimizer signals and applies bounded, explainable shifts.
+    Propose schedule changes using the Random Forest fatigue model (Crew Manager).
+
+    Reassigns CA/FO on high-risk pilot-days and may apply a small spacing shift when
+    still critical. Does not use airport congestion or delay-based slot shifting.
     """
     df = normalize_columns(master_df).copy()
     if df.columns.duplicated().any():
@@ -235,14 +232,7 @@ def propose_optimized_schedule(master_df: pd.DataFrame, max_shift_minutes: int =
         if col not in df.columns:
             df[col] = "N/A"
 
-    clean_df = clean_flight_data_enhanced(df.copy())
-    optimizer = EnhancedScheduleOptimizer(clean_df)
-
-    # Build congestion lookup (airport, hour) -> congestion level
-    congestion_lookup = {}
-    if hasattr(optimizer, "congestion_df") and not optimizer.congestion_df.empty:
-        for _, r in optimizer.congestion_df.iterrows():
-            congestion_lookup[(str(r["Airport"]), int(r["Hour"]))] = float(r["CongestionLevel"])
+    predictor = get_pilot_fatigue_predictor(_FATIGUE_PREDICTOR_RESOURCE_VERSION)
 
     proposed = df.copy()
     proposed["Orig_STD"] = proposed["STD"].astype(str)
@@ -250,45 +240,176 @@ def propose_optimized_schedule(master_df: pd.DataFrame, max_shift_minutes: int =
     proposed["Change_Reason"] = ""
     proposed["Risk_Reduction_%"] = 0.0
 
-    # Crew daily load for simple reassignment (hours)
     proposed["DateKey"] = proposed["Date_dt"].dt.strftime("%Y-%m-%d")
-    proposed["DurationHrs"] = ((proposed["STA_dt"] - proposed["STD_dt"]).dt.total_seconds() / 3600).fillna(1.5).clip(0.5, 6)
+    proposed["DurationHrs"] = (
+        (proposed["STA_dt"] - proposed["STD_dt"]).dt.total_seconds() / 3600
+    ).fillna(1.5).clip(0.5, 6)
 
-    crew_load = proposed.groupby(["Captain", "DateKey"])["DurationHrs"].sum().to_dict()
-    captains = [c for c in proposed["Captain"].dropna().unique().tolist() if str(c).strip() and str(c) != "N/A"]
+    captains = [
+        c for c in proposed["Captain"].dropna().unique().tolist()
+        if str(c).strip() and str(c).upper() != "N/A"
+    ]
+    fos = [
+        f for f in proposed["First Officer"].dropna().unique().tolist()
+        if str(f).strip() and str(f).upper() != "N/A"
+    ]
 
+    def _append_reason(idx, text: str):
+        cur = str(proposed.at[idx, "Change_Reason"] or "").strip()
+        proposed.at[idx, "Change_Reason"] = (cur + "; " if cur else "") + text
+
+    ALT_CRIT_MAX = 0.55
+    MIN_CRIT_DROP = 0.03
+    MAX_PASSES = 3
+    MAX_ALTS_CAP = min(12, max(1, len(captains) - 1)) if len(captains) > 1 else 0
+    MAX_ALTS_FO = min(12, max(1, len(fos) - 1)) if len(fos) > 1 else 0
+
+    rf = predictor.model
+
+    def _rf_predict_row(h, r, w):
+        return int(rf.predict(np.array([[float(h), float(r), float(w)]], dtype=np.float64))[0])
+
+    for _ in range(MAX_PASSES):
+        summ = _summarize_pilot_days(proposed)
+        ranked = []
+        for (pilot, dkey), srow in summ.iterrows():
+            h, r, w = _fatigue_triple_from_totals(
+                float(srow["total_h"]), int(srow["sectors"]), int(srow["delays"])
+            )
+            pred = _rf_predict_row(h, r, w)
+            if pred < 1:
+                continue
+            pe, pm, pc = predictor.class_probs(h, r, w)
+            ranked.append((pc, pm, str(pilot), str(dkey)))
+        ranked.sort(reverse=True)
+        changed = False
+
+        for _, __, pilot, dkey in ranked:
+            m = (
+                ((proposed["Captain"] == pilot) | (proposed["First Officer"] == pilot))
+                & (proposed["DateKey"].astype(str) == dkey)
+            )
+            sub = proposed.loc[m]
+            if sub.empty:
+                continue
+            j = sub["DurationHrs"].idxmax()
+
+            ph, ps, pdel = _summ_get(summ, pilot, dkey)
+            h0, r0, w0 = _fatigue_triple_from_totals(ph, ps, pdel)
+            pe0, pm0, pc0 = predictor.class_probs(h0, r0, w0)
+
+            dur = float(proposed.loc[j, "DurationHrs"])
+            dly = (
+                1 if str(proposed.loc[j, "Status"]).lower() == "delayed" else 0
+            )
+
+            if str(proposed.loc[j, "Captain"]) == pilot and len(captains) > 1 and MAX_ALTS_CAP > 0:
+                cand = [c for c in captains if c != pilot]
+                cand.sort(
+                    key=lambda a: predictor.class_probs(
+                        *_fatigue_triple_from_totals(*_summ_get(summ, a, dkey))
+                    )[2]
+                )
+                best_alt = None
+                best_drop = 0.0
+                ph2, ps2, pdel2 = ph - dur, ps - 1, pdel - dly
+                for alt in cand[:MAX_ALTS_CAP]:
+                    ah, as_, adel = _summ_get(summ, alt, dkey)
+                    ah2, as2, adel2 = ah + dur, as_ + 1, adel + dly
+                    hp, rp, wp = _fatigue_triple_from_totals(ph2, ps2, pdel2)
+                    ha, ra, wa = _fatigue_triple_from_totals(ah2, as2, adel2)
+                    _, _, pac = predictor.class_probs(ha, ra, wa)
+                    if pac > ALT_CRIT_MAX:
+                        continue
+                    _, _, ppc = predictor.class_probs(hp, rp, wp)
+                    drop = pc0 - ppc
+                    if drop > best_drop:
+                        best_drop = drop
+                        best_alt = alt
+                if best_alt is not None and best_drop >= MIN_CRIT_DROP:
+                    proposed.at[j, "Captain"] = best_alt
+                    summ = _summarize_pilot_days(proposed)
+                    ph1, ps1, pdel1 = _summ_get(summ, pilot, dkey)
+                    h1, r1, w1 = _fatigue_triple_from_totals(ph1, ps1, pdel1)
+                    _, pm1, pc1 = predictor.class_probs(h1, r1, w1)
+                    reduc = (pc0 - pc1) * 100.0 + (pm0 - pm1) * 35.0
+                    proposed.at[j, "Risk_Reduction_%"] = max(
+                        float(proposed.at[j, "Risk_Reduction_%"] or 0),
+                        round(min(80.0, max(6.0, reduc)), 1),
+                    )
+                    _append_reason(j, f"Fatigue RF: CA swap ({pilot}→{best_alt})")
+                    changed = True
+
+            elif str(proposed.loc[j, "First Officer"]) == pilot and len(fos) > 1 and MAX_ALTS_FO > 0:
+                cand = [x for x in fos if x != pilot]
+                cand.sort(
+                    key=lambda a: predictor.class_probs(
+                        *_fatigue_triple_from_totals(*_summ_get(summ, a, dkey))
+                    )[2]
+                )
+                best_alt = None
+                best_drop = 0.0
+                ph2, ps2, pdel2 = ph - dur, ps - 1, pdel - dly
+                for alt in cand[:MAX_ALTS_FO]:
+                    ah, as_, adel = _summ_get(summ, alt, dkey)
+                    ah2, as2, adel2 = ah + dur, as_ + 1, adel + dly
+                    hp, rp, wp = _fatigue_triple_from_totals(ph2, ps2, pdel2)
+                    ha, ra, wa = _fatigue_triple_from_totals(ah2, as2, adel2)
+                    _, _, pac = predictor.class_probs(ha, ra, wa)
+                    if pac > ALT_CRIT_MAX:
+                        continue
+                    _, _, ppc = predictor.class_probs(hp, rp, wp)
+                    drop = pc0 - ppc
+                    if drop > best_drop:
+                        best_drop = drop
+                        best_alt = alt
+                if best_alt is not None and best_drop >= MIN_CRIT_DROP:
+                    proposed.at[j, "First Officer"] = best_alt
+                    summ = _summarize_pilot_days(proposed)
+                    ph1, ps1, pdel1 = _summ_get(summ, pilot, dkey)
+                    h1, r1, w1 = _fatigue_triple_from_totals(ph1, ps1, pdel1)
+                    _, pm1, pc1 = predictor.class_probs(h1, r1, w1)
+                    reduc = (pc0 - pc1) * 100.0 + (pm0 - pm1) * 35.0
+                    proposed.at[j, "Risk_Reduction_%"] = max(
+                        float(proposed.at[j, "Risk_Reduction_%"] or 0),
+                        round(min(80.0, max(6.0, reduc)), 1),
+                    )
+                    _append_reason(j, f"Fatigue RF: FO swap ({pilot}→{best_alt})")
+                    changed = True
+
+        if not changed:
+            break
+
+    # Duty spacing: one pass, cache (captain, day) fatigue probabilities
+    cap_day_cache = {}
     for idx, row in proposed.iterrows():
-        origin_code = str(row.get("From", "UNK"))
-        origin_code = origin_code.split("(")[-1].split(")")[0].strip().upper() if "(" in origin_code else origin_code
-        dep_hour = int(row["STD_dt"].hour) if pd.notna(row["STD_dt"]) else 0
-        congestion = congestion_lookup.get((origin_code, dep_hour), 0.0)
-        is_delayed = str(row.get("Status", "")).lower() == "delayed"
-
-        if congestion >= 0.7 or is_delayed:
-            shift = min(max_shift_minutes, 30 if congestion >= 0.85 else 15)
+        cap = str(row.get("Captain", "")).strip()
+        if not cap or cap.upper() == "N/A":
+            continue
+        dkey = str(row["DateKey"])
+        ck = (cap, dkey)
+        if ck not in cap_day_cache:
+            h, r, w = fatigue_features_for_pilot_day(proposed, cap, dkey)
+            cap_day_cache[ck] = (
+                _rf_predict_row(h, r, w),
+                predictor.class_probs(h, r, w),
+            )
+        pred, (_, _, pc) = cap_day_cache[ck]
+        if pred == 2 and not str(proposed.at[idx, "Change_Reason"] or "").strip():
+            shift = min(max_shift_minutes, 20)
             proposed.at[idx, "STD_dt"] = row["STD_dt"] + pd.Timedelta(minutes=shift)
             proposed.at[idx, "STA_dt"] = row["STA_dt"] + pd.Timedelta(minutes=shift)
-            proposed.at[idx, "Change_Reason"] = f"Congestion-adjusted slot (+{shift}m)"
-            proposed.at[idx, "Risk_Reduction_%"] = round(min(40.0, congestion * 35 + (10 if is_delayed else 0)), 1)
-
-        # Crew reassignment when captain daily duty exceeds 12h
-        cap = str(row.get("Captain", "N/A"))
-        dkey = row.get("DateKey", "")
-        if crew_load.get((cap, dkey), 0) > 12 and captains:
-            alt = min(captains, key=lambda c: crew_load.get((c, dkey), 0))
-            if alt != cap:
-                proposed.at[idx, "Captain"] = alt
-                crew_load[(cap, dkey)] = max(0, crew_load.get((cap, dkey), 0) - row["DurationHrs"])
-                crew_load[(alt, dkey)] = crew_load.get((alt, dkey), 0) + row["DurationHrs"]
-                reason = proposed.at[idx, "Change_Reason"]
-                proposed.at[idx, "Change_Reason"] = (reason + "; " if reason else "") + f"Crew rebalance ({cap}→{alt})"
+            proposed.at[idx, "Change_Reason"] = f"Fatigue RF: duty spacing (+{shift}m)"
+            proposed.at[idx, "Risk_Reduction_%"] = round(
+                min(45.0, 10.0 + float(pc) * 28.0), 1
+            )
 
     proposed["STD"] = proposed["STD_dt"].dt.strftime("%I:%M %p")
     proposed["STA"] = proposed["STA_dt"].dt.strftime("%I:%M %p")
     proposed["Optimization_Changed"] = (
-        (proposed["Orig_STD"] != proposed["STD"]) |
-        (proposed["Orig_STA"] != proposed["STA"]) |
-        (proposed["Change_Reason"].astype(str) != "")
+        (proposed["Orig_STD"] != proposed["STD"])
+        | (proposed["Orig_STA"] != proposed["STA"])
+        | (proposed["Change_Reason"].astype(str) != "")
     )
 
     return proposed.drop(columns=["Date_dt", "DateKey", "DurationHrs"], errors="ignore")
@@ -443,6 +564,8 @@ class ScheduleTuner:
 
     def _build_aircraft_networks(self):
         """Build network graph of aircraft rotations for impact analysis"""
+        import networkx as nx
+
         self.aircraft_networks = {}
         for aircraft in self.df['Aircraft_Registration'].dropna().unique():
             aircraft_flights = self.df[self.df['Aircraft_Registration'] == aircraft].sort_values('STD_dt')
@@ -1152,6 +1275,28 @@ class PilotFatiguePredictor:
         pred = self.model.predict(X_test)[0]
         return int(pred), prob
 
+    def class_probs(self, hours: float, ratio: float, workload: float):
+        """Single numpy predict_proba call (faster than DataFrame in hot loops)."""
+        p = self.model.predict_proba(
+            np.array([[float(hours), float(ratio), float(workload)]], dtype=np.float64)
+        )[0]
+        return float(p[0]), float(p[1]), float(p[2])
+
+
+# Bump when PilotFatiguePredictor API or training changes so Streamlit does not reuse a stale
+# cached instance from before hot reload (old instances lack newly added methods).
+_FATIGUE_PREDICTOR_RESOURCE_VERSION = 2
+
+
+@st.cache_resource(show_spinner=False)
+def get_pilot_fatigue_predictor(
+    _resource_version: int = _FATIGUE_PREDICTOR_RESOURCE_VERSION,
+) -> "PilotFatiguePredictor":
+    """Train the fatigue Random Forest once per Streamlit process."""
+    del _resource_version  # cache key only
+    return PilotFatiguePredictor()
+
+
 class DecisionSupportFramework:
     """Combines deterministic rules with ML predictions for pilot scheduling."""
     @staticmethod
@@ -1212,10 +1357,7 @@ def render_pilot_fatigue_dashboard():
     st.markdown('<div class="crew-sub">Real-time fatigue classification with DGCA compliance checks</div>', unsafe_allow_html=True)
     st.markdown("---")
 
-    # ── Initialize predictor ──
-    if 'fatigue_predictor' not in st.session_state:
-        st.session_state['fatigue_predictor'] = PilotFatiguePredictor()
-    predictor = st.session_state['fatigue_predictor']
+    predictor = get_pilot_fatigue_predictor(_FATIGUE_PREDICTOR_RESOURCE_VERSION)
 
     # ── Layout: 2 / 1 ──
     col_left, col_right = st.columns([2, 1])
@@ -1880,7 +2022,6 @@ def render_scheduling_board():
     df_board = df_board.sort_values(["_sb_sort_date", "_sb_sort_fn"], na_position="last").drop(
         columns=["_sb_sort_date", "_sb_sort_fn"]
     )
-    n_all_flights = len(df_board)
 
     # Optimization controls (proposal vs confirm/discard)
     c1, c2, c3 = st.columns([1.5, 1.2, 1.2])
@@ -1890,7 +2031,10 @@ def render_scheduling_board():
                 st.session_state.get("master_df", df_dash),
                 max_shift_minutes=60
             )
-            st.success("Optimization proposal generated. Review and confirm to apply globally.")
+            st.success(
+                "Fatigue-model optimization proposal generated (Random Forest). "
+                "Review and confirm to apply globally."
+            )
     with c2:
         if st.button("✔ Confirm & Apply Optimization", key="confirm_schedule_opt", use_container_width=True):
             if "optimized_df" in st.session_state and not st.session_state["optimized_df"].empty:
@@ -1929,37 +2073,15 @@ def render_scheduling_board():
             )
         st.markdown("---")
 
-    only_compliant = st.checkbox(
-        "Only show flights that pass crew rules",
-        value=True,
-        key="sched_board_compliant_only",
-        help="Uses the same limits as the board (max duties, block hours, no double-booked aircraft per pilot). "
-        "Tightening Crew Manager sliders can remove more flights from this list.",
-    )
-    prev_filt = st.session_state.get("_sched_board_compliant_prev")
-    if prev_filt is not None and prev_filt != only_compliant:
-        st.session_state["schedule_board_offset"] = 0
-    st.session_state["_sched_board_compliant_prev"] = only_compliant
-
-    df_view = df_board
-    if only_compliant:
-        df_view = filter_schedule_board_passing_flights(df_board, crew_rules)
-
-    n_total = len(df_view)
+    n_total = len(df_board)
     max_offset = max(0, (max(n_total - 1, 0) // PAGE_SIZE) * PAGE_SIZE)
     if st.session_state["schedule_board_offset"] > max_offset:
         st.session_state["schedule_board_offset"] = max_offset
 
     off = int(st.session_state["schedule_board_offset"])
-    page_df = df_view.iloc[off : off + PAGE_SIZE]
+    page_df = df_board.iloc[off : off + PAGE_SIZE]
     start_i = off + 1 if n_total else 0
     end_i = min(off + PAGE_SIZE, n_total)
-
-    if only_compliant and n_all_flights > 0 and n_total == 0:
-        st.warning(
-            "No flights pass the current crew rules. Relax the **Crew Manager** sliders or turn off "
-            "**Only show flights that pass crew rules** to see the full schedule."
-        )
 
     st.caption(
         "Board rules follow **Crew Manager** sliders: "
@@ -1967,11 +2089,6 @@ def render_scheduling_board():
         f"**{crew_rules['max_block_h']}h** block cap, **{crew_rules['min_rest_h']}h** rest threshold, "
         f"fatigue warn after **{crew_rules['fatigue_thresh']}** duties."
     )
-    if only_compliant and n_all_flights:
-        hidden = n_all_flights - n_total
-        st.caption(
-            f"**{n_total}** flights pass ({hidden} hidden). Uncheck the box to show all **{n_all_flights}** flights."
-        )
 
     nav_a, nav_b, nav_c = st.columns([1, 2, 1])
     with nav_a:
@@ -2997,6 +3114,8 @@ def main():
         # TAB 4 — CASCADING DELAYS
         # ═══════════════════════════════════════════
         with tab_cascade:
+            import networkx as nx
+
             analyzer = optimizer.cascading_analyzer
 
             # ── Network rotation graph ──
@@ -3163,10 +3282,8 @@ def main():
         # 3. Fatigue Risk Pilots
         st.markdown("### Fatigue Risk Pilots")
         
-        if 'fatigue_predictor' not in st.session_state:
-            st.session_state['fatigue_predictor'] = PilotFatiguePredictor()
-        predictor = st.session_state['fatigue_predictor']
-        
+        predictor = get_pilot_fatigue_predictor(_FATIGUE_PREDICTOR_RESOURCE_VERSION)
+
         all_pilots = set(df_dash['Captain'].dropna()).union(set(df_dash['First Officer'].dropna()))
         
         critical_pilots = []
@@ -3238,6 +3355,8 @@ def map_enhanced_query(query: str, sbert_model, col_keys, col_emb, op_keys, op_e
 
     # Semantic matching is optional; fall back to keyword routing when SBERT is unavailable.
     if sbert_model is not None and col_emb is not None and op_emb is not None:
+        from sentence_transformers import util
+
         q_emb = sbert_model.encode(query, convert_to_tensor=True)
 
         # Calculate similarities
@@ -3544,8 +3663,10 @@ def ensemble_predict_enhanced(rf_pipe, model_b, meta, input_row: pd.DataFrame):
 
 
 def load_sbert(name="all-MiniLM-L6-v2"):
-    """Load sentence transformer model with caching"""
+    """Load sentence transformer lazily (only when Flight Ops NLP runs)."""
     try:
+        from sentence_transformers import SentenceTransformer
+
         return SentenceTransformer(name)
     except Exception as e:
         st.session_state["nlp_model_error"] = str(e)
@@ -3686,6 +3807,8 @@ def validate_data_quality(df):
 # ------------------------------
 def calculate_network_effects(df):
     """Calculate network-wide delay propagation effects"""
+    import networkx as nx
+
     # Build flight network graph
     network = nx.DiGraph()
 
