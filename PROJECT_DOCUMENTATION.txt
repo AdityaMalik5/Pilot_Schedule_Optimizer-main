@@ -68,8 +68,9 @@ C) Embedded HTML + JavaScript (streamlit.components.v1.components.html)
    • Aircraft timeline / Gantt: per-aircraft rows, flight blocks, filters,
      detail panel (route, times, crew, conflict reason).
    • Interactive Scheduling Board: drag-and-drop reassignment of flight cards
-     between pilots, real-time “impact” side panel (conflicts, warnings,
-     fatigue-style meters), undo/redo, JavaScript-side conflict detection.
+     between pilots (now paginated), real-time “impact” side panel (conflicts,
+     warnings, fatigue-style meters), undo/redo, JavaScript-side conflict detection.
+     Includes filters to show only compliant flights based on crew limit sliders.
 
 Characteristics relevant to scheduling UX:
    • Monospace labels and metrics support scanability in ops-style dashboards.
@@ -147,8 +148,8 @@ Key modules / classes in test4.py (conceptual layers):
      retraining every rerun.
 
 5.2 Dashboard / Crew / Board / Alerts (pilot-centric)
-  • load_dashboard_data loads or synthesizes rows with From/To/STD/STA and
-    synthetic Captain, First Officer, Status for Gantt and roster views.
+  • load_dashboard_data loads rows with From/To/STD/STA. Now requires user 
+    CSV upload instead of rendering synthetic demo data by default.
   • Sidebar “Quick Pilot Lookup” can set session state to open pilot profile
     (render_pilot_detail_page) with weekly timeline HTML and charts.
   • Schedule Board injects large HTML/JS string with flight and pilot JSON for
@@ -243,6 +244,11 @@ Key modules / classes in test4.py (conceptual layers):
 7.4 ScheduleTuner
   Shifts STD; recomputes delay risk for new hour; counts downstream flights on
   same registration potentially affected when shift exceeds turnaround buffer.
+
+7.5 Crew-Centric Automated Schedule Optimization
+  Proposes schedule changes using the Random Forest fatigue model. Reassigns 
+  Captains and First Officers on high-risk pilot-days and applies small spacing 
+  shifts (up to 20m) for duty spacing when still fatigue-critical.
 
 Advantages of this hybrid approach:
   • Interpretable factors (capacity, peak hours) align with how dispatchers

@@ -29,13 +29,16 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 from sklearn.metrics import accuracy_score, classification_report
 
-# Try to import XGBoost
+# Try to import XGBoost.
+# Note: on macOS this can fail with XGBoostError when native deps like libomp
+# aren't present. We catch broadly so the app can fall back gracefully.
 try:
     from xgboost import XGBClassifier
 
     XGBOOST_AVAILABLE = True
-except ImportError:
+except Exception as e:
     XGBOOST_AVAILABLE = False
+    XGBOOST_IMPORT_ERROR = str(e)
 
 
 # ------------------------------
@@ -59,7 +62,10 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
         "ATD": ["atd", "actual departure", "actual_dep"],
         "ATA": ["ata", "actual arrival", "actual_arr"],
         "Flight time": ["flight time", "flight_time", "duration", "block_time"],
-        "Aircraft": ["aircraft", "aircraft registration", "tail", "tail number", "aircraft_reg"],
+        "Aircraft": [
+            "aircraft", "aircraft registration", "tail", "tail number", "aircraft_reg",
+            "registration", "ac_reg", "tail_no", "aircraft reg",
+        ],
         "UniqueCarrier": ["carrier", "airline", "airline code", "uniquecarrier"],
         "S.No": ["s.no", "s no", "serial", "serial number"],
         "Status": ["status", "flight status"],
@@ -98,6 +104,8 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
         out["S.No"] = np.arange(1, len(out) + 1)
     if "Status" not in out.columns:
         out["Status"] = "On Time"
+    if "Aircraft" not in out.columns:
+        out["Aircraft"] = ""
 
     return out
 
@@ -457,13 +465,55 @@ def clean_flight_data_enhanced(df: pd.DataFrame) -> pd.DataFrame:
         'Flight time': 'FlightTime'
     }, inplace=True)
 
+    # Minimal CSVs often omit aircraft / times; avoid KeyError on upload.
+    if "Aircraft" not in df.columns:
+        df["Aircraft"] = ""
+    for col in ("STD", "STA"):
+        if col not in df.columns:
+            df[col] = "12:00 AM"
+    if "ATD" not in df.columns:
+        df["ATD"] = df["STD"]
+    if "ATA" not in df.columns:
+        df["ATA"] = df["STA"]
+    if "FlightTime" not in df.columns:
+        df["FlightTime"] = np.nan
+
     # Extract Airport Codes
     df['Origin'] = df['Origin_City'].str.extract(r'\((\w+)\)').fillna('')
     df['Dest'] = df['Dest_City'].str.extract(r'\((\w+)\)').fillna('')
 
+    def _infer_iata_from_city_label(label) -> str:
+        """When From/To lack (CODE), map common Indian city text to AIRPORT_CONFIG keys."""
+        if pd.isna(label):
+            return ""
+        raw = str(label).strip()
+        u = raw.upper()
+        if u in AIRPORT_CONFIG:
+            return u
+        for key, code in (
+            ("CHHATRAPATI", "BOM"), ("MUMBAI", "BOM"), ("BOMBAY", "BOM"),
+            ("INDIRA GANDHI", "DEL"), ("DELHI", "DEL"),
+            ("BENGALURU", "BLR"), ("BANGALORE", "BLR"),
+            ("KEMPEGOWDA", "BLR"),
+            ("NETAJI", "CCU"), ("KOLKATA", "CCU"), ("CALCUTTA", "CCU"),
+            ("CHANDIGARH", "IXC"),
+            ("BHUBANESWAR", "BBI"), ("BIJU PATNAIK", "BBI"),
+        ):
+            if key in u:
+                return code
+        return ""
+
+    _mo = df["Origin"].astype(str).str.strip().eq("") | df["Origin"].isna()
+    if _mo.any():
+        df.loc[_mo, "Origin"] = df.loc[_mo, "Origin_City"].map(_infer_iata_from_city_label)
+    _md = df["Dest"].astype(str).str.strip().eq("") | df["Dest"].isna()
+    if _md.any():
+        df.loc[_md, "Dest"] = df.loc[_md, "Dest_City"].map(_infer_iata_from_city_label)
+
     # Create Aircraft Registration from Aircraft column
-    df['Aircraft_Registration'] = df['Aircraft'].str.extract(r'([A-Z]{2}-[A-Z]{3})')
-    df['Aircraft_Type'] = df['Aircraft'].str.extract(r'([A-Z0-9]+)')
+    _ac = df["Aircraft"].astype(str)
+    df['Aircraft_Registration'] = _ac.str.extract(r'([A-Z]{2}-[A-Z]{3})')
+    df['Aircraft_Type'] = _ac.str.extract(r'([A-Z0-9]+)')
 
     # Drop original city columns and other unused columns
     df.drop(columns=[
@@ -794,6 +844,20 @@ AIRPORT_CONFIG = {
     }
 }
 
+# Empty pd.DataFrame([]) has no columns — downstream code indexes "Airport" and crashes.
+_ENHANCED_CONGESTION_COLUMNS = [
+    "Airport", "Hour", "DepartureCount", "ArrivalCount", "TotalFlights",
+    "Utilization", "CongestionLevel", "IsAvoidableSlot",
+]
+_ENHANCED_DELAY_PATTERN_COLUMNS = [
+    "Airport", "Hour", "AvgDepDelay", "AvgArrDelay", "DelayVolatility",
+    "FlightCount", "DelayRisk", "CascadingRisk",
+]
+_ENHANCED_BUSIEST_SLOT_COLUMNS = [
+    "Airport", "Hour", "CongestionLevel", "TotalFlights",
+    "Recommendation", "AlternativeSlots",
+]
+
 
 # ------------------------------
 # Enhanced Schedule Optimizer
@@ -851,6 +915,8 @@ class EnhancedScheduleOptimizer:
                 })
 
         self.congestion_df = pd.DataFrame(congestion_data)
+        if self.congestion_df.empty:
+            self.congestion_df = pd.DataFrame(columns=_ENHANCED_CONGESTION_COLUMNS)
 
     def _get_enhanced_congestion_level(self, utilization, config, hour):
         """Enhanced congestion calculation"""
@@ -902,6 +968,8 @@ class EnhancedScheduleOptimizer:
                     })
 
         self.delay_patterns_df = pd.DataFrame(delay_patterns)
+        if self.delay_patterns_df.empty:
+            self.delay_patterns_df = pd.DataFrame(columns=_ENHANCED_DELAY_PATTERN_COLUMNS)
 
     def _calculate_enhanced_delay_risk(self, stats, cascading_risk):
         """Enhanced delay risk calculation including cascading effects"""
@@ -937,6 +1005,8 @@ class EnhancedScheduleOptimizer:
                 })
 
         self.busiest_slots_df = pd.DataFrame(busiest_slots)
+        if self.busiest_slots_df.empty:
+            self.busiest_slots_df = pd.DataFrame(columns=_ENHANCED_BUSIEST_SLOT_COLUMNS)
 
     def _get_avoidance_recommendation(self, congestion_level):
         """Get recommendation text based on congestion level"""
@@ -1212,9 +1282,30 @@ def create_schedule_tuning_visualization(tuning_results):
 
 def create_busiest_slots_heatmap(optimizer: EnhancedScheduleOptimizer):
     """Create heatmap showing busiest time slots to avoid"""
-    pivot_data = optimizer.congestion_df.pivot(
-        index='Airport', columns='Hour', values='CongestionLevel'
-    )
+    cdf = getattr(optimizer, "congestion_df", None)
+    if cdf is None or cdf.empty or "Airport" not in cdf.columns:
+        fig = go.Figure()
+        fig.update_layout(
+            height=400,
+            title="No congestion data",
+            annotations=[
+                dict(
+                    text=(
+                        "No flights matched configured airports (BOM, DEL, BLR, CCU, IXC, BBI). "
+                        "Use From/To like \"Airport (BOM)\" so Origin/Dest codes extract correctly."
+                    ),
+                    xref="paper",
+                    yref="paper",
+                    x=0.5,
+                    y=0.5,
+                    showarrow=False,
+                    font=dict(size=12),
+                )
+            ],
+        )
+        return fig
+
+    pivot_data = cdf.pivot(index="Airport", columns="Hour", values="CongestionLevel")
 
     fig = px.imshow(
         pivot_data,

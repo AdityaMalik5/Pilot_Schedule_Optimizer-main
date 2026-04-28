@@ -1,0 +1,288 @@
+================================================================================
+  FLIGHT SCHEDULE OPTIMIZER (test4.py) — COMPREHENSIVE RESULTS & METHODOLOGY
+================================================================================
+Generated as a reference for reporting, review, or external analysis (e.g. upload
+to another tool). Numeric KPIs that depend on YOUR uploaded CSV are not hard-
+coded here; this file documents what the application computes, how, and which
+values are fixed in code vs. data-driven.
+
+--------------------------------------------------------------------------------
+1. PURPOSE OF THE SYSTEM
+--------------------------------------------------------------------------------
+The Streamlit application (test4.py) supports:
+  • Loading and normalizing flight CSV data (routes, times, aircraft, delays).
+  • Congestion and delay-pattern analytics for configured Indian hub airports.
+  • Cascading delay / turnaround risk scoring per flight.
+  • Interactive schedule tuning (simulated time shifts with before/after delay
+    risk and downstream aircraft impact).
+  • Enhanced ML models predicting arrival-delay binary outcomes using engineered
+    features (including peak hours, weekends, turnaround pressure, cascading risk).
+  • Pilot fatigue risk (Random Forest on synthetic rule-based training data) with
+    deterministic rule checks; schedule optimization proposes crew swaps and small
+    duty spacing shifts based on that model.
+  • NLP query interface (when Sentence-BERT is available) over column semantics.
+
+“Efficiency” in this project is expressed through: lower composite slot scores
+(congestion + delay + cascading), lower historical delay rate at a slot, reduced
+fatigue critical probability after swaps, and qualitative banding (EXCELLENT → AVOID).
+
+
+--------------------------------------------------------------------------------
+2. DATA PIPELINE & KEY DERIVED METRICS (clean_flight_data_enhanced)
+--------------------------------------------------------------------------------
+After cleaning, each flight row includes:
+  • DepDelay, ArrDelay (minutes; ATD−STD, ATA−STA).
+  • DepHour, ArrHour (from actual times).
+  • Turnaround_Time: gap in minutes between this flight’s ATA and the next
+    scheduled departure on the same aircraft registration.
+  • Is_Quick_Turnaround: 1 if Turnaround_Time < 90 minutes.
+  • Cascading_Risk_Score (0–1 scale, sum of three weighted components):
+      – 0.4 × I(DepDelay > 15 min)
+      – 0.3 × Is_Quick_Turnaround
+      – 0.3 × I(DepHour in peak set {7,8,9,17,18,19,20})
+  • ArrDelayBinary / DepDelayBinary: 1 if delay > 15 minutes (used for ML target
+    and feature engineering in enhanced models).
+
+Distance is approximated as AirTime_minutes × 8 (heuristic).
+
+
+--------------------------------------------------------------------------------
+3. AIRPORT CONFIGURATION (fixed parameters — AIRPORT_CONFIG)
+--------------------------------------------------------------------------------
+Six airports are modeled with declared hourly capacity, peak hours, and stress
+multipliers. Congestion uses these together with observed traffic counts.
+
+Code  Airport   Capacity/hr  Peak hours (examples)     weather_delays  ground_congestion
+----  --------  -------------  ------------------------  --------------  -----------------
+BOM   Mumbai    45             8–10, 17–20               0.15            0.85
+DEL   Delhi     80             7–9, 18–20                0.18            0.90
+BLR   Bangalore 50             8–9, 17–19                0.10            0.80
+CCU   Kolkata   35             7–8, 17–18                0.14            0.75
+IXC   Chandigarh 15            7–8, 16–17                0.10            0.60
+BBI   Bhubaneswar 20           8–9, 18–19                0.12            0.70
+
+(Runway counts are stored per airport for context; utilization uses capacity_per_hour.)
+
+
+--------------------------------------------------------------------------------
+4. CONGESTION MODEL (EnhancedScheduleOptimizer._calculate_congestion_metrics)
+--------------------------------------------------------------------------------
+For each airport and hour 0–23:
+  • dep_count = departures from that airport in that hour (from data).
+  • arr_count = arrivals at that airport in that hour (from data).
+  • total_count = dep_count + arr_count.
+  • utilization = total_count / capacity_per_hour (capped at 1.0 for display column).
+
+Enhanced congestion level (before cap at 1.0):
+  base = utilization
+  IF hour in airport peak_hours:   base × 1.4
+  THEN:                             base × (1 + weather_delays)
+  THEN:                             base × ground_congestion
+
+Slot flagging:
+  • IsAvoidableSlot = true when utilization > 0.80 (80% of declared hourly capacity).
+
+Interpretation for “efficiency / congestion”:
+  • Lower CongestionLevel ⇒ relatively less modeled pressure at that hour.
+  • Slots marked avoidable are candidates to shift traffic away from in planning
+    discussions; exact operational gain is not a single fixed % — it depends on
+    how many movements you move and real airport constraints outside this model.
+
+
+--------------------------------------------------------------------------------
+5. DELAY RISK PER HOUR (_calculate_delay_patterns, _calculate_enhanced_delay_risk)
+--------------------------------------------------------------------------------
+Per airport and hour (where flights exist in the data):
+  • Aggregates mean/median/std of DepDelay and ArrDelay, flight count, and mean
+    Cascading_Risk_Score for that hour.
+
+DelayRisk for the hour:
+  base_risk = (max(0, mean_dep_delay) + std_dep_delay) / 100
+  total_risk = 0.7 × base_risk + 0.3 × mean_cascading_risk_for_hour
+  (capped at 1.0)
+
+So “efficiency” at slot level blends empirical delay level/volatility with the
+average cascading risk of flights departing in that hour.
+
+
+--------------------------------------------------------------------------------
+6. OPTIMAL SLOT RANKING (find_optimal_slots_enhanced)
+--------------------------------------------------------------------------------
+For each hour with both congestion and delay rows present, a composite score is
+computed (higher = worse conditions):
+
+  total_score = 0.4 × CongestionLevel
+              + 0.3 × DelayRisk
+              + 0.3 × CascadingRisk
+
+Hours are sorted by total_score ascending; the lowest scores are the recommended
+slots (up to max_slots, default 10).
+
+Qualitative bands (_get_enhanced_recommendation_text / _get_optimality_rating):
+  score < 0.25  → EXCELLENT (5 stars)
+  score < 0.40  → GOOD (4 stars)
+  score < 0.60  → MODERATE (3 stars)
+  score < 0.75  → BUSY (2 stars)
+  score ≥ 0.75  → AVOID (1 star)
+
+BUSIEST SLOTS LIST: per airport, top 8 hours by CongestionLevel with avoidance
+text and suggested nearby lower-congestion alternatives within ±2 hours when
+available (CongestionLevel < 0.5).
+
+AVOIDANCE TEXT THRESHOLDS (congestion_level only):
+  ≥ 0.9  → AVOID — extreme congestion
+  ≥ 0.7  → AVOID — very busy
+  ≥ 0.5  → CAUTION — moderate
+  <  0.5 → ACCEPTABLE — low congestion
+
+
+--------------------------------------------------------------------------------
+7. SCHEDULE TUNER — SIMULATED SHIFT OUTCOMES (ScheduleTuner)
+--------------------------------------------------------------------------------
+When a departure is shifted by N minutes:
+  • original_delay_risk / new_delay_risk: fraction of historical flights in the
+    dataset with same Origin and DepHour where DepDelay > 15 minutes (after
+    updating hour for the hypothetical new time). If no history: default 0.3.
+  • risk_change = new − original (negative ⇒ modeled risk reduction at new slot).
+  • Cascading: examines up to the next 3 flights on the same aircraft; counts
+    affected flights if the shift exceeds available turnaround buffer; sums a
+    simple delay propagation estimate in minutes.
+
+This gives a transparent before/after story for “efficiency” of a time change
+conditional on your CSV’s historical delays at that airport-hour.
+
+
+--------------------------------------------------------------------------------
+8. CASCADING IMPACT ANALYZER (CascadingDelayAnalyzer)
+--------------------------------------------------------------------------------
+Per-flight cascading_impact_score ∈ [0, 1] is a weighted sum:
+  • 40%: historical P(DepDelay > 15) at same origin + departure hour.
+  • 30%: aircraft utilization intensity (flights per calendar day / 8, capped).
+  • 20%: turnaround pressure (<60 min → +0.2; <90 min → +0.15).
+  • 10%: peak-hour departure (7–9, 17–20).
+
+Risk categories:
+  score ≥ 0.7  HIGH
+  score ≥ 0.5  MEDIUM
+  score ≥ 0.3  LOW-MEDIUM
+  score <  0.3 LOW
+
+YOUR RUN-TIME RESULTS: mean/max impact by origin, and “top N” highest-impact
+flights — values come from the dataframe after cleaning (see Flight Ops UI).
+
+
+--------------------------------------------------------------------------------
+9. ENHANCED ML MODELS (train_enhanced_models) — DELAY PREDICTION
+--------------------------------------------------------------------------------
+Target: ArrDelayBinary = 1 if ArrDelay > 15 minutes.
+
+Engineered features (subset available in data):
+  Month, DayOfWeek, DepHour, Distance, AirTime,
+  IsPeakHour (per AIRPORT_CONFIG at origin),
+  IsWeekend (Sat/Sun),
+  HasQuickTurnaround, TurnaroundPressure (<90 min gap),
+  Cascading_Risk_Score.
+
+Train/test: 80/20 split, stratified when both classes exist, random_state=42.
+
+Model A — Pipeline: StandardScaler + RandomForestClassifier
+  n_estimators=150, max_depth=12, min_samples_split=5, n_jobs=-1
+
+Model B — XGBoost if installed, else GradientBoostingClassifier
+  n_estimators=150, max_depth=6, learning_rate=0.1, subsample=0.8
+  (XGB: use_label_encoder=False, eval_metric=logloss)
+
+METRICS STORED IN SESSION (meta):
+  • rf_acc, model_b_acc — test-set accuracy (floats).
+  • model_b_name — "XGBoost" or "GradientBoosting".
+  • features — list of feature names actually used.
+
+YOUR RESULTS: Open Flight Operations → tab “ML Model & NLP Query” → expander
+“Enhanced Model Performance”; the two accuracy metrics and feature list are the
+project outputs for this block. They change every time the underlying dataframe
+changes.
+
+
+--------------------------------------------------------------------------------
+10. PILOT FATIGUE RANDOM FOREST (PilotFatiguePredictor)
+--------------------------------------------------------------------------------
+Training data: synthetic (n=1000, seed=42). Features are uniform-random within
+ranges; labels follow deterministic rules:
+  Critical (2):  hours ≥ 9 OR ratio ≥ 2.0 OR workload ≥ 80
+  Moderate (1):  else if hours ≥ 6 OR ratio ≥ 1.2 OR workload ≥ 55
+  Efficient (0): otherwise
+
+Model: RandomForestClassifier, n_estimators=100, max_depth=5, random_state=42.
+
+Operational mapping from schedule to features (fatigue_features_for_pilot_day /
+_fatigue_triple_from_totals): aggregates per pilot per calendar day — total block
+time, sector count, delayed leg count — then maps to (avg_flight_hours proxy,
+duty_to_rest_ratio proxy, workload_index proxy) with clipping rules in code.
+
+IMPORTANT: This is NOT calibrated on real biometric data; it encodes a consistent
+stress proxy for demo/decision support. Do not treat probabilities as regulatory
+compliance evidence.
+
+DecisionSupportFramework hard rules (applied alongside ML):
+  • Reject if block hours > 10 or duty/rest ratio > 2.5 (deterministic).
+
+
+--------------------------------------------------------------------------------
+11. OPTIMIZE SCHEDULE (propose_optimized_schedule) — CREW / SPACING ONLY
+--------------------------------------------------------------------------------
+Explicitly documented in code: does NOT use airport congestion or delay-based
+slot shifting for this step. It uses the fatigue RF only.
+
+Parameters (fixed in code):
+  ALT_CRIT_MAX = 0.55     (alternate pilot’s critical class probability must stay ≤ this)
+  MIN_CRIT_DROP = 0.03    (minimum drop in original pilot’s critical prob to accept swap)
+  MAX_PASSES = 3          (outer refinement passes)
+  MAX_ALTS_CAP / MAX_ALTS_FO = min(12, max(1, n−1)) for captain / FO pools
+
+Actions:
+  1) Swap Captain or First Officer on the longest leg of a high-risk pilot-day
+     when an alternate reduces critical probability enough without pushing the
+     alternate over ALT_CRIT_MAX.
+  2) Spacing pass: if still critical and no prior change on row, shift STD/STA
+     by up to min(max_shift_minutes, 20) minutes later (default max_shift 30).
+
+Displayed “Risk_Reduction_%” is a derived display metric from probability deltas
+(bounded in code), not a measured operational KPI.
+
+YOUR RESULTS: rows with Change_Reason and Risk_Reduction_% after clicking
+optimize; compare counts and reasons in the exported/optimized dataframe.
+
+
+--------------------------------------------------------------------------------
+12. FLIGHT OPS DASHBOARD KPIs (typical on-screen outputs)
+--------------------------------------------------------------------------------
+With data loaded, the app commonly shows:
+  • Total flights, number of configured airports (6).
+  • Average Cascading_Risk_Score across df.
+  • Count of flights with Cascading_Risk_Score > 0.7 (“high risk” threshold).
+
+These are instantaneous summaries of the current master/optimized dataframe.
+
+
+--------------------------------------------------------------------------------
+13. WHAT THIS DOCUMENT DOES NOT CONTAIN (honesty clause)
+--------------------------------------------------------------------------------
+  • No single “project-wide % efficiency gain” — the tool does not run a closed-
+    form A/B against a live airline baseline; improvements are local (per slot,
+    per simulated shift, per optimized row).
+  • No fixed accuracy for fatigue RF on real operations (synthetic labels).
+  • No guarantee that congestion multipliers match real NOTAM/capacity notices;
+    they are configurable priors in AIRPORT_CONFIG.
+
+To capture run-specific numbers for external review, record from the UI at the
+same time as your CSV: ML accuracies, KPI metrics, top cascading flights, optimal
+slot tables for chosen airports, and optimize-schedule change summary.
+
+
+--------------------------------------------------------------------------------
+14. FILE & ENTRYPOINT
+--------------------------------------------------------------------------------
+Primary application: test4.py (Streamlit).
+Default sample data file name referenced in code: Flight_Data.csv (if present).
+
+End of document — COMPREHENSIVE_PROJECT_RESULTS.txt

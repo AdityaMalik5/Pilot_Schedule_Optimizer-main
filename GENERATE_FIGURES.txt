@@ -1,0 +1,121 @@
+============================================================
+ HOW TO GENERATE THE THREE RESEARCH-PAPER FIGURES
+============================================================
+
+What you will get (all saved next to the script, 300 DPI PNGs):
+  1. fig_fatigue_tiers.png    — grouped bars: pilot-day counts
+                                per fatigue tier (Efficient /
+                                Moderate / Critical), baseline
+                                vs optimized.
+  2. fig_dgca_violations.png  — two bars: total DGCA violations
+                                (daily-duty >12h, duty/rest >1.5,
+                                weekly >60h), baseline vs optimized.
+  3. fig_convergence.png      — line: fatigue objective
+                                (Σ P(Critical) over pilot-days)
+                                vs optimizer iteration.
+
+Data source: monthly_schedule_30days_cleaned.csv (already in repo).
+Script:      make_paper_figures.py (already generated in repo).
+
+------------------------------------------------------------
+ WHY A VIRTUAL ENV
+------------------------------------------------------------
+Your system Python is 3.14, and the installed numpy 2.4.4 has a
+broken C-extension under that version (ImportError on
+_PyUnstable_Object_IsUniqueReferencedTemporary). Homebrew ships
+python3.12 which works fine — we just need to install the four
+deps into an isolated venv so we don't fight macOS's
+PEP-668 "externally-managed-environment" block.
+
+------------------------------------------------------------
+ COMMANDS — RUN THESE IN ORDER
+------------------------------------------------------------
+
+# 1. cd into the project
+cd "/Users/rexeus/Downloads/Flight_Schedule_Optimizer-main"
+
+# 2. Create the venv (one time only; reuse afterwards)
+python3.12 -m venv /tmp/fsov
+
+# 3. Install the four dependencies into the venv
+/tmp/fsov/bin/pip install numpy pandas scikit-learn matplotlib
+
+# 4. Run the figure generator
+/tmp/fsov/bin/python make_paper_figures.py
+
+# 5. Verify the outputs were created
+ls -la fig_fatigue_tiers.png fig_dgca_violations.png fig_convergence.png
+
+------------------------------------------------------------
+ EXPECTED CONSOLE OUTPUT (roughly)
+------------------------------------------------------------
+[1/6] Loading monthly schedule...
+      rows=..., days=30, captains=..., fos=...
+[2/6] Training fatigue Random Forest...
+[3/6] Computing baseline metrics...
+      tiers={0: .., 1: .., 2: ..}, violations=..
+[4/6] Running optimizer with convergence logging...
+      convergence history: [.., .., .., ..]
+[5/6] Computing optimized metrics...
+      tiers={0: .., 1: .., 2: ..}, violations=..
+[6/6] Rendering figures...
+
+Saved:
+  fig_fatigue_tiers.png
+  fig_dgca_violations.png
+  fig_convergence.png
+
+------------------------------------------------------------
+ ONE-LINER (if you just want to run everything)
+------------------------------------------------------------
+cd "/Users/rexeus/Downloads/Flight_Schedule_Optimizer-main" && \
+python3.12 -m venv /tmp/fsov && \
+/tmp/fsov/bin/pip install numpy pandas scikit-learn matplotlib && \
+/tmp/fsov/bin/python make_paper_figures.py
+
+------------------------------------------------------------
+ AFTER THE FIRST RUN — RE-RUNNING IS FAST
+------------------------------------------------------------
+The venv and deps persist. To regenerate the figures later:
+
+cd "/Users/rexeus/Downloads/Flight_Schedule_Optimizer-main"
+/tmp/fsov/bin/python make_paper_figures.py
+
+------------------------------------------------------------
+ IF /tmp/fsov GETS WIPED ON REBOOT
+------------------------------------------------------------
+macOS may clean /tmp. If the venv is gone, put it somewhere
+persistent instead:
+
+python3.12 -m venv ~/.venvs/fsov
+~/.venvs/fsov/bin/pip install numpy pandas scikit-learn matplotlib
+~/.venvs/fsov/bin/python make_paper_figures.py
+
+------------------------------------------------------------
+ TROUBLESHOOTING
+------------------------------------------------------------
+- "python3.12 not found" → install via Homebrew:
+      brew install python@3.12
+- "No module named sklearn" → rerun step 3 (pip install).
+- CSV path error → make sure you are cd'd into the project
+  folder before running step 4.
+- Want to tweak the look (colors, sizes, labels) → edit the
+  plot_* functions near the bottom of make_paper_figures.py
+  and re-run step 4 only.
+
+------------------------------------------------------------
+ WHAT THE SCRIPT DOES INTERNALLY (summary)
+------------------------------------------------------------
+- Loads monthly_schedule_30days_cleaned.csv and derives a
+  "DateKey" + DurationHrs from "Flight time".
+- Trains the same 3-class Random Forest fatigue predictor as
+  test4.py (identical synthetic training recipe and seed).
+- Computes baseline fatigue tiers per pilot-day and counts
+  DGCA violations (daily duty >12h, duty/rest ratio >1.5,
+  rolling weekly >60h).
+- Runs the fatigue optimizer loop (Captain/First Officer
+  reassignment, mirrors propose_optimized_schedule) for up
+  to 8 passes, recording the fatigue objective after each
+  pass so we get a real convergence curve.
+- Re-scores the optimized schedule and produces the three
+  PNGs at 300 DPI, ready to drop into the paper.
