@@ -131,7 +131,7 @@ def crew_rules_for_schedule_board() -> dict:
     max_block_h = round(min(12.0, max(6.0, h)), 2)
     max_duties = int(max(3, min(7, round(6 - max(0.0, r - 1.5) * 1.2))))
     min_rest_h = round(float(max(6.0, min(12.0, 8.0 + (r - 1.5) * 1.5))), 2)
-    fatigue_thresh = int(max(2, min(5, round(4 - (w - 35) / 22))))
+    fatigue_thresh = max(3, max_duties - 2)
     duty_hours = round(min(3.5, max(1.2, max_block_h / max(max_duties, 1))), 2)
 
     return {
@@ -387,6 +387,63 @@ def propose_optimized_schedule(master_df: pd.DataFrame, max_shift_minutes: int =
 
         if not changed:
             break
+
+    # --- Workload Balancing Pass ---
+    # Equalise duty counts across captains/FOs so no one is over/under-loaded
+    summ = _summarize_pilot_days(proposed)
+    for role, pool in [("Captain", captains), ("First Officer", fos)]:
+        if len(pool) < 3:
+            continue
+        duty_counts = {p: int((proposed[role] == p).sum()) for p in pool}
+        avg_d = sum(duty_counts.values()) / len(pool)
+        balance_thresh = max(2, int(avg_d * 0.30))
+
+        over = sorted(
+            [(p, n) for p, n in duty_counts.items() if n > avg_d + balance_thresh],
+            key=lambda x: -x[1],
+        )
+        under = sorted(
+            [(p, n) for p, n in duty_counts.items() if n < avg_d - balance_thresh],
+            key=lambda x: x[1],
+        )
+
+        for over_pilot, over_n in over:
+            if not under:
+                break
+            excess = int(over_n - avg_d)
+            p_flights = proposed.loc[proposed[role] == over_pilot].sort_values(
+                "DurationHrs", ascending=True
+            )
+            moved = 0
+            for idx in p_flights.index:
+                if moved >= excess or not under:
+                    break
+                dkey = str(proposed.at[idx, "DateKey"])
+                dur = float(proposed.at[idx, "DurationHrs"])
+                dly = 1 if str(proposed.at[idx, "Status"]).lower() == "delayed" else 0
+                best_target = None
+                best_pc = 1.0
+                for u_pilot, _ in under:
+                    ah, as_, adel = _summ_get(summ, u_pilot, dkey)
+                    ha, ra, wa = _fatigue_triple_from_totals(ah + dur, as_ + 1, adel + dly)
+                    _, _, pac = predictor.class_probs(ha, ra, wa)
+                    if pac < ALT_CRIT_MAX and pac < best_pc:
+                        best_target = u_pilot
+                        best_pc = pac
+                if best_target is not None:
+                    proposed.at[idx, role] = best_target
+                    _append_reason(idx, f"Workload balance: {role[:2]} ({over_pilot}\u2192{best_target})")
+                    proposed.at[idx, "Risk_Reduction_%"] = max(
+                        float(proposed.at[idx, "Risk_Reduction_%"] or 0), 5.0
+                    )
+                    duty_counts[over_pilot] -= 1
+                    duty_counts[best_target] += 1
+                    summ = _summarize_pilot_days(proposed)
+                    under = sorted(
+                        [(p, n) for p, n in duty_counts.items() if n < avg_d - balance_thresh],
+                        key=lambda x: x[1],
+                    )
+                    moved += 1
 
     # Duty spacing: one pass, cache (captain, day) fatigue probabilities
     cap_day_cache = {}
@@ -2282,7 +2339,7 @@ body { font-family:'Space Mono',monospace; background:#f8fafc; color:#0f172a; ov
 .fc-pill-amber { background:#fef3c7; color:#b45309; }
 .fc-pill-red { background:#fee2e2; color:#b91c1c; }
 .fc-pill-blue { background:#dbeafe; color:#1d4ed8; }
-.card-green  { background:#10b981; border-color:#059669; color:#14532d; }
+.card-green  { background:#e8f5e9; border-color:#4caf50; color:#1b5e20; box-shadow: inset 0 0 0 1px rgba(76,175,80,0.30); }
 .card-amber  { background:#f59e0b; border-color:#d97706; color:#78350f; }
 .card-red    { background:#fff1f2; border-color:#dc2626; color:#7f1d1d; box-shadow: inset 0 0 0 2px rgba(220,38,38,0.25); }
 .card-blue   { background:#dbeafe; border-color:#3b82f6; color:#0f172a; }
@@ -2326,10 +2383,10 @@ body { font-family:'Space Mono',monospace; background:#f8fafc; color:#0f172a; ov
   <button class="btn-apply" id="btnApply" onclick="applyChanges()" disabled>Apply All</button>
 </div>
 <div class="legend">
-  <span><div class="dot" style="background:#10b981"></div> Valid</span>
+  <span><div class="dot" style="background:#dbeafe;border:1px solid #3b82f6"></div> Normal</span>
+  <span><div class="dot" style="background:#e8f5e9;border:1px solid #4caf50"></div> Optimized</span>
   <span><div class="dot" style="background:#f59e0b"></div> Fatigue Risk</span>
   <span><div class="dot" style="background:#ef4444"></div> DGCA Conflict</span>
-  <span><div class="dot" style="background:#dbeafe;border:1px solid #3b82f6"></div> Unchanged</span>
 </div>
 <div class="board" id="board"></div>
 </div>
@@ -2346,6 +2403,7 @@ body { font-family:'Space Mono',monospace; background:#f8fafc; color:#0f172a; ov
 const flights = __FLIGHTS_JSON__;
 const pilots  = __PILOTS_JSON__;
 const DUTY_HOURS = __DUTY_HOURS__, MAX_DUTIES = __MAX_DUTIES__, MAX_BLOCK_H = __MAX_BLOCK_H__, MIN_REST_H = __MIN_REST_H__, FATIGUE_THRESH = __FATIGUE_THRESH__;
+const IS_OPTIMIZED = __IS_OPTIMIZED__;
 
 let assignments = {};
 let undoStack = [], redoStack = [];
@@ -2418,15 +2476,32 @@ function buildFlightTooltipHtml(fl, rowPilot) {
 }
 
 function detectConflicts(pName, fids) {
-  let issues = [], dutyCount = fids.length, totalBlock = dutyCount * DUTY_HOURS;
-  if (dutyCount > MAX_DUTIES) {
-    issues.push({ type:'conflict', msg: pName + ': ' + dutyCount + ' duties (DGCA max ' + MAX_DUTIES + ')' });
-    issues.push({ type:'conflict', msg: pName + ': insufficient rest (<' + MIN_REST_H + 'h)' });
-  }
-  if (totalBlock > MAX_BLOCK_H) issues.push({ type:'conflict', msg: pName + ': ' + totalBlock.toFixed(1) + 'h block (max ' + MAX_BLOCK_H + 'h)' });
-  if (dutyCount > FATIGUE_THRESH && dutyCount <= MAX_DUTIES) issues.push({ type:'warning', msg: pName + ': ' + dutyCount + ' duties (fatigue risk)' });
-  let acMap = {};
-  fids.forEach(fid => { let fl = getFlightById(fid); if (fl) { if (acMap[fl.aircraft]) issues.push({ type:'conflict', msg:'Aircraft ' + fl.aircraft + ' double-booked by ' + pName }); acMap[fl.aircraft] = true; } });
+  let issues = [];
+  // Group flights by calendar date for per-day limit checks
+  let dayMap = {};
+  fids.forEach(fid => {
+    let fl = getFlightById(fid);
+    if (!fl) return;
+    let day = fl.date_label || 'unknown';
+    if (!dayMap[day]) dayMap[day] = [];
+    dayMap[day].push(fid);
+  });
+  let multiDay = Object.keys(dayMap).length > 1;
+  // Per-day duty / block / fatigue checks
+  Object.keys(dayMap).forEach(day => {
+    let dayFids = dayMap[day];
+    let dutyCount = dayFids.length, totalBlock = dutyCount * DUTY_HOURS;
+    let tag = multiDay ? ' (' + day + ')' : '';
+    if (dutyCount > MAX_DUTIES) {
+      issues.push({ type:'conflict', msg: pName + tag + ': ' + dutyCount + ' duties (DGCA max ' + MAX_DUTIES + ')' });
+      issues.push({ type:'conflict', msg: pName + tag + ': insufficient rest (<' + MIN_REST_H + 'h)' });
+    }
+    if (totalBlock > MAX_BLOCK_H) issues.push({ type:'conflict', msg: pName + tag + ': ' + totalBlock.toFixed(1) + 'h block (max ' + MAX_BLOCK_H + 'h)' });
+    if (dutyCount > FATIGUE_THRESH && dutyCount <= MAX_DUTIES) issues.push({ type:'warning', msg: pName + tag + ': ' + dutyCount + ' duties (fatigue risk)' });
+  });
+  // Aircraft double-booking (per date)
+  let acDayMap = {};
+  fids.forEach(fid => { let fl = getFlightById(fid); if (fl) { let k = (fl.aircraft||'') + '|' + (fl.date_label||''); if (acDayMap[k]) issues.push({ type:'conflict', msg:'Aircraft ' + fl.aircraft + ' double-booked by ' + pName }); acDayMap[k] = true; } });
   return issues;
 }
 
@@ -2435,8 +2510,8 @@ function getCardClass(pilot, fid) {
   let isChanged = !originalAssignments[pilot] || !originalAssignments[pilot].includes(fid);
   if (issues.some(i => i.type === 'conflict')) return 'card-red';
   if (issues.some(i => i.type === 'warning'))  return 'card-amber';
-  if (isChanged) return 'card-green';
-  return 'card-blue';
+  if (isChanged) return IS_OPTIMIZED ? 'card-green' : 'card-blue';
+  return IS_OPTIMIZED ? 'card-green' : 'card-blue';
 }
 function getRowClass(pilot) {
   let issues = detectConflicts(pilot, assignments[pilot] || []);
@@ -2609,6 +2684,7 @@ renderBoard();
         .replace('__MAX_BLOCK_H__', str(crew_rules['max_block_h']))
         .replace('__MIN_REST_H__', str(crew_rules['min_rest_h']))
         .replace('__FATIGUE_THRESH__', str(crew_rules['fatigue_thresh']))
+        .replace('__IS_OPTIMIZED__', 'true' if st.session_state.get('optimization_applied') else 'false')
     )
 
     st.markdown("# \u2708\ufe0f Interactive Scheduling Board")
